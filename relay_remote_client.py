@@ -542,9 +542,10 @@ class RelayRemoteClient:
         self.audio_count = 0
         self.connect_time = None
 
-        # Video
+        # Video - latest_frame for snapshot, broadcaster for MJPEG streaming
         self.video_lock = threading.Lock()
         self.latest_frame = None
+        self.video_broadcaster = StreamBroadcaster("video")
         self.audio_broadcaster = StreamBroadcaster("audio")
 
     def connect(self):
@@ -786,6 +787,7 @@ class RelayRemoteClient:
                 jpeg_data = data[jpeg_start:end_pos]
                 with self.video_lock:
                     self.latest_frame = jpeg_data
+                self.video_broadcaster.broadcast(jpeg_data)
                 self.frame_count += 1
                 if self.frame_count % 30 == 0:
                     log(f"Frame {self.frame_count} ({len(jpeg_data)}B, "
@@ -920,29 +922,24 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
 
-        last_frame_id = None
-        no_data = 0
+        cl = self.__class__.client
+        if not cl:
+            return
+
+        # Queue-based: frames arrive at the camera's native rate (~8fps).
+        # This preserves timing so go2rtc/ffmpeg assign correct timestamps.
+        q = cl.video_broadcaster.add_listener()
         try:
             while True:
-                cl = self.__class__.client
-                if not cl:
-                    time.sleep(0.1); continue
-                with cl.video_lock:
-                    frame = cl.latest_frame
-                if frame:
-                    fid = id(frame)
-                    if fid != last_frame_id:
-                        self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n')
-                        self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
-                        self.wfile.write(frame)
-                        self.wfile.write(b'\r\n')
-                        last_frame_id = fid
-                        no_data = 0
-                else:
-                    no_data += 1
-                    if no_data > 600: break
-                time.sleep(0.033)
-        except: pass
+                frame = q.get(timeout=10.0)
+                self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n')
+                self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
+                self.wfile.write(frame)
+                self.wfile.write(b'\r\n')
+        except:
+            pass
+        finally:
+            cl.video_broadcaster.remove_listener(q)
 
     def _serve_audio(self):
         self.send_response(200)
