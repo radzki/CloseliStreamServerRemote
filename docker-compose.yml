@@ -1,0 +1,97 @@
+# Closeli Remote Stream Server
+#
+# Connects directly to Closeli cloud relay servers to receive camera video.
+# No LAN access to the camera needed - works from anywhere with internet.
+#
+# Usage:
+#   docker compose up -d                          # Camera 1
+#   docker compose --profile camera2 up -d        # Add camera 2
+#   docker compose --profile all up -d            # All configured cameras
+#
+# Endpoints:
+#   http://localhost:8081/video   - MJPEG stream
+#   http://localhost:8081/audio   - WAV audio
+#   http://localhost:8081/status  - JSON status
+#   http://localhost:8081/trigger - Re-trigger LIVE_VIEW
+
+services:
+  camera1:
+    build: .
+    container_name: closeli-camera1
+    command: >
+      python3 -u relay_remote_client.py
+      -d ${CAMERA1_DEVICE_ID}
+      -p 8081
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLOSELI_EMAIL=${CLOSELI_EMAIL}
+      - CLOSELI_PASSWORD=${CLOSELI_PASSWORD}
+      - PRODUCT_KEY=${PRODUCT_KEY}
+      - PRODUCT_SECRET=${PRODUCT_SECRET}
+      - DEFAULT_DEVICE_ID=${CAMERA1_DEVICE_ID}
+
+  camera2:
+    build: .
+    container_name: closeli-camera2
+    command: >
+      python3 -u relay_remote_client.py
+      -d ${CAMERA2_DEVICE_ID}
+      -p 8082
+    restart: unless-stopped
+    network_mode: host
+    profiles:
+      - camera2
+      - all
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLOSELI_EMAIL=${CLOSELI_EMAIL}
+      - CLOSELI_PASSWORD=${CLOSELI_PASSWORD}
+      - PRODUCT_KEY=${PRODUCT_KEY}
+      - PRODUCT_SECRET=${PRODUCT_SECRET}
+      - DEFAULT_DEVICE_ID=${CAMERA2_DEVICE_ID}
+
+  camera3:
+    build: .
+    container_name: closeli-camera3
+    command: >
+      python3 -u relay_remote_client.py
+      -d ${CAMERA3_DEVICE_ID}
+      -p 8083
+    restart: unless-stopped
+    network_mode: host
+    profiles:
+      - camera3
+      - all
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLOSELI_EMAIL=${CLOSELI_EMAIL}
+      - CLOSELI_PASSWORD=${CLOSELI_PASSWORD}
+      - PRODUCT_KEY=${PRODUCT_KEY}
+      - PRODUCT_SECRET=${PRODUCT_SECRET}
+      - DEFAULT_DEVICE_ID=${CAMERA3_DEVICE_ID}
+
+  camera4:
+    build: .
+    container_name: closeli-camera4
+    command: >
+      python3 -u relay_remote_client.py
+      -d ${CAMERA4_DEVICE_ID}
+      -p 8084
+    restart: unless-stopped
+    network_mode: host
+    profiles:
+      - camera4
+      - all
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CLOSELI_EMAIL=${CLOSELI_EMAIL}
+      - CLOSELI_PASSWORD=${CLOSELI_PASSWORD}
+      - PRODUCT_KEY=${PRODUCT_KEY}
+      - PRODUCT_SECRET=${PRODUCT_SECRET}
+      - DEFAULT_DEVICE_ID=${CAMERA4_DEVICE_ID}
