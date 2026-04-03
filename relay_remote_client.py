@@ -929,9 +929,18 @@ class StreamHandler(BaseHTTPRequestHandler):
         # Queue-based: frames arrive at the camera's native rate (~8fps).
         # This preserves timing so go2rtc/ffmpeg assign correct timestamps.
         q = cl.video_broadcaster.add_listener()
+        last_frame = None
         try:
             while True:
-                frame = q.get(timeout=10.0)
+                try:
+                    frame = q.get(timeout=2.0)
+                    last_frame = frame
+                except queue.Empty:
+                    # Relay is reconnecting — serve the last known frame to keep
+                    # go2rtc's ffmpeg alive and prevent the RTSP stream from dying.
+                    frame = last_frame
+                    if frame is None:
+                        continue  # No frame ever received yet, just wait
                 self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n')
                 self.wfile.write(f'Content-Length: {len(frame)}\r\n\r\n'.encode())
                 self.wfile.write(frame)
