@@ -106,3 +106,6 @@ python3 relay_remote_client.py -d xxxxS_aabbccddeeff -p 8081
 │ Browser  │
 └──────────┘
 ```
+
+# Work In Progress
+I am working on a way to automate camera parameters fetching just using the credentials. So, instead of populating the .env file with other variables, we would just need the username and password.
