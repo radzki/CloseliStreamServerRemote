@@ -211,7 +211,3 @@ There's also an AES key/IV pair hidden in `assets/pic_k_i.png` via the same LSB 
 ```
 
 This is used by the app for encrypting certain API request payloads (the `uDesKey` field in `cloud_pro.ini`), not for login.
-
-# Work In Progress
-
-Automating camera parameter fetching using just credentials — eliminating the need to manually populate product key/secret and device IDs in the `.env` file.

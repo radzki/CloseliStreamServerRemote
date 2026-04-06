@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Relay Remote Client - Connects to the real Closeli relay (Chinese cloud servers)
-and receives the camera's video feed.
+Relay Remote Client - Connects to Closeli relay servers and receives camera
+video/audio feeds. Auto-discovers all cameras bound to the account.
 
 Architecture (from Ghidra reverse engineering of libtcpbuffer.so):
   Connection 1 (type=6): XMPP/control session - sends LIVE_VIEW commands
   Connection 2 (type=2): Data session - receives MediaPackage video/audio
 
 Both connections go to the same relay IP:port via raw TLS (NOT WebSocket).
-The relay IP is discovered via the getRelayIPList API.
 
 Usage:
-  python3 relay_remote_client.py
-  python3 relay_remote_client.py -p 8080        # HTTP port
-  python3 relay_remote_client.py --discover-only # Just show relay info
+  python3 relay_remote_client.py                 # Auto-discover all cameras
+  python3 relay_remote_client.py -p 8080         # HTTP port
+  python3 relay_remote_client.py -d xxxxS_abc123 # Single camera only
+  python3 relay_remote_client.py --discover-only  # List cameras, then exit
 
 Endpoints:
-  http://localhost:8080/video   - MJPEG video stream
-  http://localhost:8080/audio   - WAV audio stream
-  http://localhost:8080/status  - Connection status JSON
+  http://localhost:8080/                        - Index (all cameras)
+  http://localhost:8080/video/<device_id>       - MJPEG video stream
+  http://localhost:8080/audio/<device_id>       - WAV audio stream
+  http://localhost:8080/status                  - All cameras status JSON
+  http://localhost:8080/status/<device_id>      - Single camera status
 """
 
 import argparse
@@ -469,6 +471,54 @@ def discover_relay(camera_id, product_key, product_secret):
 
 
 # ============================================================================
+# DES/ECB encryption for ESD API
+# ============================================================================
+from Crypto.Cipher import DES
+from Crypto.Util.Padding import pad as _pkcs5_pad
+
+def des_ecb_encrypt(key, plaintext):
+    """DES/ECB/PKCS5 encrypt, returns hex string."""
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode('utf-8')
+    cipher = DES.new(key, DES.MODE_ECB)
+    return cipher.encrypt(_pkcs5_pad(plaintext, DES.block_size)).hex()
+
+
+_DES_KEY = b"0P7Z4VfP"
+
+def get_device_list(token):
+    """Fetch list of cameras bound to account.
+
+    Returns list of device dicts with keys: deviceid, devicename, onlineStatus, iplist, etc.
+    """
+    payload = json.dumps({"token": token}, separators=(',', ':'))
+    encrypted = des_ecb_encrypt(_DES_KEY, payload)
+    body = urllib.parse.urlencode({"jsonObject": encrypted}).encode('utf-8')
+    headers = {
+        'User-Agent': 'IOT CLINET 1.0',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+        'Host': ESD_HOST,
+    }
+    ctx = ssl.create_default_context()
+    url = f"https://{ESD_HOST}/lecam/service/device/deviceList"
+    req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+    log("Fetching device list...", "API")
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        result = json.loads(resp.read().decode('utf-8'))
+
+    if result.get('failflag') != '0':
+        log(f"Device list failed: {result.get('failmsg')}", "ERROR")
+        return []
+
+    devices = result.get('devicelist', [])
+    log(f"Found {len(devices)} camera(s)", "OK")
+    for d in devices:
+        status = d.get('onlineStatus', 'unknown')
+        log(f"  {d['deviceid']} \"{d.get('devicename', '?')}\" [{status}]", "OK")
+    return devices
+
+
+# ============================================================================
 # TLS connection helper
 # ============================================================================
 def create_tls_connection(host, port, timeout=15):
@@ -880,54 +930,172 @@ class StreamBroadcaster:
 
 
 # ============================================================================
+# Camera Manager (multi-camera)
+# ============================================================================
+class CameraManager:
+    """Manages multiple RelayRemoteClient instances, one per camera."""
+
+    def __init__(self):
+        self.clients = {}   # device_id → RelayRemoteClient
+        self.devices = {}   # device_id → device info dict from API
+        self._threads = []
+
+    def add_camera(self, device_info, device_uuid, email, token, uid,
+                   unified_id, product_key, product_secret):
+        """Discover relay and create a client for one camera. Returns True if started."""
+        device_id = device_info['deviceid']
+        name = device_info.get('devicename', device_id)
+
+        relay_host, relay_port = None, None
+        iplist = device_info.get('iplist', [])
+        if iplist:
+            relay_host = iplist[0].get('relayhost')
+            relay_port = int(iplist[0].get('relayport', 50321))
+
+        if not relay_host:
+            try:
+                relay_host, relay_port = discover_relay(device_id, product_key, product_secret)
+            except Exception as e:
+                log(f"Relay discovery failed for \"{name}\" ({device_id}): {e}", "WARN")
+                return False
+
+        if not relay_host:
+            log(f"No relay for \"{name}\" ({device_id}) — camera offline?", "WARN")
+            return False
+
+        client = RelayRemoteClient(
+            relay_host=relay_host, relay_port=relay_port,
+            camera_id=device_id, device_uuid=device_uuid,
+            email=email, token=token, uid=uid,
+            unified_id=unified_id, product_key=product_key,
+            product_secret=product_secret,
+        )
+        self.clients[device_id] = client
+        self.devices[device_id] = device_info
+
+        t = threading.Thread(target=client.reconnect_loop, daemon=True,
+                             name=f"relay-{device_id}")
+        t.start()
+        self._threads.append(t)
+        log(f"Started relay for \"{name}\" ({device_id}) → {relay_host}:{relay_port}", "OK")
+        return True
+
+    def get_client(self, device_id):
+        return self.clients.get(device_id)
+
+    def get_status(self):
+        cameras = []
+        for did, client in self.clients.items():
+            info = self.devices.get(did, {})
+            s = client.get_status()
+            s['devicename'] = info.get('devicename', '')
+            cameras.append(s)
+        return {"cameras": cameras, "count": len(cameras)}
+
+    def disconnect_all(self):
+        for client in self.clients.values():
+            client.connected = False
+
+
+# ============================================================================
 # HTTP Server
 # ============================================================================
 class ThreadingHTTPServer(ThreadingMixIn, TCPServer):
     allow_reuse_address = True
 
 class StreamHandler(BaseHTTPRequestHandler):
-    client = None
+    manager = None  # CameraManager instance
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _parse_path(self):
+        """Parse /<action>/<device_id> from path. Returns (action, device_id_or_None)."""
+        parts = self.path.strip('/').split('/', 1)
+        action = parts[0] if parts else ''
+        device_id = parts[1] if len(parts) > 1 else None
+        return action, device_id
+
+    def _get_client(self, device_id):
+        """Get client for device_id. If None and only one camera, use that."""
+        mgr = self.__class__.manager
+        if not mgr:
+            return None
+        if device_id:
+            return mgr.get_client(device_id)
+        if len(mgr.clients) == 1:
+            return next(iter(mgr.clients.values()))
+        return None
+
+    def _send_404(self, msg="Not found"):
+        self.send_response(404)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(msg.encode())
+
     def do_GET(self):
-        if self.path == '/video':
-            self._serve_mjpeg()
-        elif self.path == '/audio':
-            self._serve_audio()
-        elif self.path == '/status':
-            self._serve_status()
-        elif self.path == '/trigger':
-            self._trigger_live_view()
+        action, device_id = self._parse_path()
+
+        if action == 'video':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._serve_mjpeg(cl)
+        elif action == 'audio':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._serve_audio(cl)
+        elif action == 'status':
+            if device_id:
+                cl = self._get_client(device_id)
+                if not cl:
+                    self._send_404("Camera not found")
+                    return
+                self._serve_camera_status(cl)
+            else:
+                self._serve_status()
+        elif action == 'trigger':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._trigger_live_view(cl)
         else:
             self._serve_index()
 
     def _serve_index(self):
+        mgr = self.__class__.manager
         self.send_response(200)
         self.send_header('Content-Type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"""<html><body>
-<h1>Closeli Remote Relay Client</h1>
-<p><a href="/video">Video Stream (MJPEG)</a></p>
-<p><a href="/audio">Audio Stream</a></p>
-<p><a href="/status">Status (JSON)</a></p>
-<p><a href="/trigger">Re-trigger LIVE_VIEW</a></p>
-<hr><img src="/video" alt="Camera Feed" style="max-width:100%">
-</body></html>""")
 
-    def _serve_mjpeg(self):
+        html = '<html><body>\n<h1>Closeli Remote Relay Client</h1>\n'
+        html += '<p><a href="/status">All cameras status (JSON)</a></p>\n<hr>\n'
+
+        if mgr:
+            for did, client in mgr.clients.items():
+                name = mgr.devices.get(did, {}).get('devicename', did)
+                status = 'connected' if client.connected else 'disconnected'
+                html += f'<h2>{name} <small>({did}) [{status}]</small></h2>\n'
+                html += f'<p><a href="/video/{did}">Video</a> | '
+                html += f'<a href="/audio/{did}">Audio</a> | '
+                html += f'<a href="/status/{did}">Status</a> | '
+                html += f'<a href="/trigger/{did}">Trigger</a></p>\n'
+                html += f'<img src="/video/{did}" alt="{name}" style="max-width:640px">\n'
+                html += '<hr>\n'
+
+        html += '</body></html>'
+        self.wfile.write(html.encode())
+
+    def _serve_mjpeg(self, cl):
         self.send_response(200)
         self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
 
-        cl = self.__class__.client
-        if not cl:
-            return
-
-        # Queue-based: frames arrive at the camera's native rate (~8fps).
-        # This preserves timing so go2rtc/ffmpeg assign correct timestamps.
         q = cl.video_broadcaster.add_listener()
         last_frame = None
         try:
@@ -950,7 +1118,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         finally:
             cl.video_broadcaster.remove_listener(q)
 
-    def _serve_audio(self):
+    def _serve_audio(self, cl):
         self.send_response(200)
         self.send_header('Content-Type', 'audio/wav')
         self.end_headers()
@@ -958,8 +1126,6 @@ class StreamHandler(BaseHTTPRequestHandler):
         hdr += b'fmt ' + struct.pack('<IHHIIHH', 18, 6, 1, 8000, 8000, 1, 8) + b'\x00\x00'
         hdr += b'data\xff\xff\xff\xff'
         self.wfile.write(hdr)
-        cl = self.__class__.client
-        if not cl: return
         q = cl.audio_broadcaster.add_listener()
         try:
             while True:
@@ -968,9 +1134,17 @@ class StreamHandler(BaseHTTPRequestHandler):
         finally:
             cl.audio_broadcaster.remove_listener(q)
 
+    def _serve_camera_status(self, cl):
+        body = json.dumps(cl.get_status(), indent=2).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _serve_status(self):
-        cl = self.__class__.client
-        status = cl.get_status() if cl else {"error": "not initialized"}
+        mgr = self.__class__.manager
+        status = mgr.get_status() if mgr else {"error": "not initialized"}
         body = json.dumps(status, indent=2).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -978,9 +1152,8 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _trigger_live_view(self):
-        cl = self.__class__.client
-        if cl and cl.connected:
+    def _trigger_live_view(self, cl):
+        if cl.connected:
             cl._send_live_view()
             msg = "LIVE_VIEW triggered"
         else:
@@ -996,16 +1169,18 @@ class StreamHandler(BaseHTTPRequestHandler):
 # ============================================================================
 def main():
     parser = argparse.ArgumentParser(description='Closeli Remote Relay Client')
-    parser.add_argument('-d', '--device_id', default=CAMERA_ID, help='Camera device ID')
+    parser.add_argument('-d', '--device_id', default=CAMERA_ID,
+                        help='Camera device ID (omit to auto-discover all)')
     parser.add_argument('-p', '--port', type=int, default=8080, help='HTTP server port')
-    parser.add_argument('--discover-only', action='store_true', help='Only discover relay')
-    parser.add_argument('--relay_host', help='Override relay host')
+    parser.add_argument('--discover-only', action='store_true',
+                        help='Only list cameras and relays, then exit')
+    parser.add_argument('--relay_host', help='Override relay host (single-camera mode)')
     parser.add_argument('--relay_port', type=int, help='Override relay port')
     args = parser.parse_args()
 
     print("=" * 70)
     print("  Closeli Remote Relay Client")
-    print("  Dual-connection: type=6 (control) + type=2 (data)")
+    print("  Multi-camera auto-discovery")
     print("=" * 70)
 
     # Validate config
@@ -1014,7 +1189,6 @@ def main():
     if not PASSWORD: missing.append("CLOSELI_PASSWORD")
     if not PRODUCT_KEY: missing.append("PRODUCT_KEY")
     if not PRODUCT_SECRET: missing.append("PRODUCT_SECRET")
-    if not args.device_id: missing.append("DEFAULT_DEVICE_ID")
     if missing:
         log(f"Required config missing: {', '.join(missing)}", "ERROR")
         log("Set them in .env or environment variables. See .env.example", "ERROR")
@@ -1026,45 +1200,58 @@ def main():
     if not token:
         sys.exit(1)
 
-    # Discover relay
-    relay_host = args.relay_host
-    relay_port = args.relay_port
-    if not relay_host:
-        relay_host, relay_port = discover_relay(args.device_id, PRODUCT_KEY, PRODUCT_SECRET)
-        if not relay_host:
-            log("Cannot find camera relay. Is the camera online?", "ERROR")
+    # Build device list: either single camera or auto-discover
+    if args.device_id and args.relay_host:
+        # Fully manual single-camera mode
+        devices = [{"deviceid": args.device_id, "devicename": args.device_id,
+                     "onlineStatus": "available",
+                     "iplist": [{"relayhost": args.relay_host,
+                                 "relayport": str(args.relay_port or 50321)}]}]
+    elif args.device_id:
+        # Single camera specified, discover its relay
+        devices = [{"deviceid": args.device_id, "devicename": args.device_id,
+                     "onlineStatus": "available", "iplist": []}]
+    else:
+        # Auto-discover all cameras
+        devices = get_device_list(token)
+        if not devices:
+            log("No cameras found on account", "ERROR")
             sys.exit(1)
 
     if args.discover_only:
-        log(f"Relay: {relay_host}:{relay_port}", "OK")
+        for d in devices:
+            did = d['deviceid']
+            name = d.get('devicename', '?')
+            status = d.get('onlineStatus', '?')
+            iplist = d.get('iplist', [])
+            relay = f"{iplist[0]['relayhost']}:{iplist[0]['relayport']}" if iplist else "no relay"
+            print(f"  {did} \"{name}\" [{status}] {relay}")
         return
 
+    # Start cameras
+    manager = CameraManager()
+    started = 0
+    for d in devices:
+        if manager.add_camera(d, DEVICE_UUID, EMAIL, token, uid,
+                              unified_id, PRODUCT_KEY, PRODUCT_SECRET):
+            started += 1
+
+    if started == 0:
+        log("No cameras could be started (all offline?)", "ERROR")
+        sys.exit(1)
+
+    StreamHandler.manager = manager
+
     print()
-    print(f"  Relay:     {relay_host}:{relay_port}")
-    print(f"  Camera:    {args.device_id}")
-    print(f"  Client:    {DEVICE_UUID}")
-    print(f"  Video:     http://localhost:{args.port}/video")
+    print(f"  Cameras:   {started}/{len(devices)} online")
+    print(f"  Port:      {args.port}")
+    for did in manager.clients:
+        name = manager.devices[did].get('devicename', did)
+        print(f"  Video:     http://localhost:{args.port}/video/{did}  ({name})")
     print(f"  Status:    http://localhost:{args.port}/status")
-    print(f"  Trigger:   http://localhost:{args.port}/trigger")
+    print(f"  Index:     http://localhost:{args.port}/")
     print("=" * 70)
     print()
-
-    client = RelayRemoteClient(
-        relay_host=relay_host,
-        relay_port=relay_port,
-        camera_id=args.device_id,
-        device_uuid=DEVICE_UUID,
-        email=EMAIL,
-        token=token,
-        uid=uid,
-        unified_id=unified_id,
-        product_key=PRODUCT_KEY,
-        product_secret=PRODUCT_SECRET,
-    )
-    StreamHandler.client = client
-
-    relay_thread = threading.Thread(target=client.reconnect_loop, daemon=True)
-    relay_thread.start()
 
     server = ThreadingHTTPServer(('0.0.0.0', args.port), StreamHandler)
     log(f"HTTP server on port {args.port}", "OK")
@@ -1074,7 +1261,7 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        client.connected = False
+        manager.disconnect_all()
         server.shutdown()
 
 
