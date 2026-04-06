@@ -2,27 +2,30 @@
 
 Standalone client that connects to Closeli (Eoolii/Taismart) cloud relay servers to receive camera MJPEG video and audio streams. No LAN access to the camera required — works from anywhere with internet.
 
+All cameras on your account are **auto-discovered** and served through a **single HTTP port** (default `8080`), with each camera's feed accessible by its device ID.
+
 ## How It Works
 
 The client reverse-engineers the Closeli relay protocol:
 
 1. **API Login** — authenticates with the Closeli cloud
-2. **Relay Discovery** — finds which relay server the camera is connected to
-3. **Dual TLS Auth** — opens two raw TLS connections to the relay:
+2. **Auto-Discovery** — fetches all cameras bound to your account
+3. **Relay Discovery** — finds which relay server each camera is connected to
+4. **Dual TLS Auth** — opens two raw TLS connections per camera to the relay:
    - **Type=6** (control) — sends LIVE_VIEW commands to the camera
    - **Type=2** (data) — receives MJPEG video and audio
-4. **HTTP Server** — exposes the stream as standard MJPEG over HTTP
+5. **HTTP Server** — exposes all camera streams on a single port, identified by device ID
 
 ## Quick Start
 
 ```bash
 cp .env.example .env
-# Edit .env with your credentials and camera device ID
+# Edit .env with your credentials
 
 docker compose up -d
 ```
 
-Video stream available at `http://localhost:8081/video`
+Open `http://localhost:8080/` for an index page listing all discovered cameras with live previews.
 
 ## Configuration
 
@@ -32,35 +35,41 @@ Copy `.env.example` to `.env` and fill in:
 |---|---|
 | `CLOSELI_EMAIL` | Your Eoolii app login email |
 | `CLOSELI_PASSWORD` | Your Eoolii app password |
-| `PRODUCT_KEY` | Product key (extract from APK) |
-| `PRODUCT_SECRET` | Product secret (extract from APK) |
-| `CAMERA1_DEVICE_ID` | Camera device ID (`xxxxS_<mac_no_colons>`) |
+| `PRODUCT_KEY` | Product key (see [Extracting Product Key & Secret](#extracting-product-key--secret-from-the-apk)) |
+| `PRODUCT_SECRET` | Product secret (see [Extracting Product Key & Secret](#extracting-product-key--secret-from-the-apk)) |
 
-Find your camera's device ID in the Eoolii app under device settings, or derive it from the camera's MAC address: `xxxxS_` + MAC without colons, lowercase.
+No per-camera configuration is needed — all cameras on the account are discovered automatically.
 
 ## Endpoints
 
+All cameras are served on a single port (default `8080`). Each camera's feed is accessed by its device ID:
+
 | Path | Description |
 |---|---|
-| `/video` | MJPEG video stream |
-| `/audio` | WAV audio stream (G.711 A-law, 8kHz mono) |
-| `/status` | JSON connection status |
-| `/trigger` | Re-send LIVE_VIEW command |
+| `/` | Index page — lists all cameras with live previews |
+| `/video/<device_id>` | MJPEG video stream for a specific camera |
+| `/audio/<device_id>` | WAV audio stream (G.711 A-law, 8kHz mono) |
+| `/status` | JSON status for all cameras |
+| `/status/<device_id>` | JSON status for a specific camera |
+| `/trigger/<device_id>` | Re-send LIVE_VIEW command to a specific camera |
+
+If only one camera is connected, `/video` and `/audio` (without a device ID) also work.
 
 ## Multiple Cameras
 
+No extra configuration needed. The client auto-discovers all cameras on your account at startup:
+
 ```bash
-# Camera 1 only (default)
 docker compose up -d
-
-# Add camera 2
-docker compose --profile camera2 up -d
-
-# All configured cameras
-docker compose --profile all up -d
 ```
 
-Each camera gets its own port: camera1=8081, camera2=8082, etc.
+All cameras share the same port (`8080`). Access individual feeds via their device ID in the URL path (e.g. `http://localhost:8080/video/xxxxS_aabbccddeeff`).
+
+To list all cameras without starting streams:
+
+```bash
+python3 relay_remote_client.py --discover-only
+```
 
 ## Frigate / go2rtc Integration
 
@@ -69,7 +78,7 @@ Add to your go2rtc config:
 ```yaml
 streams:
   closeli_cam1:
-    - http://localhost:8081/video
+    - http://localhost:8080/video/<device_id>
 ```
 
 The MJPEG stream is delivered at the camera's native framerate (~8fps) with proper frame pacing.
@@ -77,7 +86,7 @@ The MJPEG stream is delivered at the camera's native framerate (~8fps) with prop
 ## Running Without Docker
 
 ```bash
-pip install -r /dev/null  # No dependencies — stdlib only
+pip install -r requirements.txt
 
 # Set environment variables or create .env
 export CLOSELI_EMAIL=user@example.com
@@ -85,20 +94,30 @@ export CLOSELI_PASSWORD=password
 export PRODUCT_KEY=your_key
 export PRODUCT_SECRET=your_secret
 
-python3 relay_remote_client.py -d xxxxS_aabbccddeeff -p 8081
+# Auto-discover all cameras
+python3 relay_remote_client.py
+
+# Or target a single camera
+python3 relay_remote_client.py -d xxxxS_aabbccddeeff
+
+# Custom port
+python3 relay_remote_client.py -p 9090
 ```
 
 ## Architecture
 
 ```
-┌──────────┐    TLS (type=6)     ┌──────────────┐
-│          │◄───────────────────►│              │
-│  Client  │    TLS (type=2)     │ Closeli      │     ┌────────┐
-│          │◄───────────────────►│ Relay Server │◄───►│ Camera │
-│          │                     │              │     └────────┘
-└────┬─────┘                     └──────────────┘
-     │
-     │ HTTP :8081
+               TLS (type=6,2)    ┌──────────────┐     ┌──────────┐
+               ┌────────────────►│              │◄───►│ Camera 1 │
+┌──────────┐   │                 │   Closeli    │     └──────────┘
+│          │◄──┤                 │   Relay      │
+│  Client  │   │ TLS (type=6,2)  │   Server(s)  │     ┌──────────┐
+│          │◄──┼────────────────►│              │◄───►│ Camera 2 │
+│          │   │                 │              │     └──────────┘
+└────┬─────┘   │  ...            └──────────────┘
+     │         │
+     │ HTTP :8080
+     │  /video/<device_id>
      ▼
 ┌──────────┐
 │ Frigate  │
