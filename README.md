@@ -107,5 +107,111 @@ python3 relay_remote_client.py -d xxxxS_aabbccddeeff -p 8081
 └──────────┘
 ```
 
+## Extracting Product Key & Secret from the APK
+
+The product key and secret are not user credentials — they are app-level constants embedded in the Eoolii APK (`com.taismart.global`). All users share the same values. The app hides them using **LSB steganography** in PNG images and **BuildConfig** string constants.
+
+There are two sets (the app auto-selects based on region):
+
+| Region | Product Key | Product Secret |
+|---|---|---|
+| International (abroad) | `c90466a2-6ea` | `PzEIWxPeAwuNF8sWRzc9` |
+| Domestic (China) | `115fe14d-b9f` | `YmVthdCug6q8xYkHeWNa` |
+
+If you need to re-extract these (e.g. after an app update), here's the process:
+
+### 1. Decompile the APK
+
+```bash
+# Install jadx (Java decompiler)
+wget https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip
+unzip jadx-1.5.1.zip -d jadx
+
+# Decompile (skip resources to speed things up)
+jadx/bin/jadx --no-res --no-debug-info -d jadx_out eoolii.apk
+```
+
+### 2. Find the Product Key in BuildConfig
+
+The product key (`client_id` for API login) is in plain text:
+
+```bash
+cat jadx_out/sources/com/arcsoft/closeli/BuildConfig.java | grep "Key"
+```
+
+Look for:
+```java
+public static final String Key = "115fe14d-b9f";
+public static final String Key_abroad = "c90466a2-6ea";
+public static final String Key_domestic = "115fe14d-b9f";
+```
+
+### 3. Extract the Product Secret via Steganography
+
+The product secret is hidden in PNG images using **Least Significant Bit (LSB)** encoding in the red channel. The relevant source is `gg/r.java` (originally `LeastSignificantBit.java`).
+
+The secret is embedded in these asset files:
+
+| File | Region |
+|---|---|
+| `assets/app_sct.png` | Default (same as domestic) |
+| `assets/app_sct_abroad.png` | International |
+| `assets/app_sct_domestic.png` | Domestic (China) |
+
+Extract the PNGs from the APK:
+
+```bash
+unzip eoolii.apk "assets/app_sct*.png" -d /tmp
+```
+
+Decode with Python:
+
+```python
+from PIL import Image
+
+def lsb_decode(path):
+    img = Image.open(path)
+    w = img.width
+    px = img.load()
+
+    # First 2 bytes encode the payload length (big-endian, 7-bit shifted)
+    length_bytes = []
+    for byte_idx in range(2):
+        bits = [0] * 8
+        for bit in range(7, -1, -1):
+            px_idx = byte_idx * 8 + (7 - bit)
+            bits[bit] = ((px[px_idx % w, px_idx // w][0] & 1) << bit)
+        length_bytes.append(
+            bits[7]|bits[6]|bits[5]|bits[4]|bits[3]|bits[2]|bits[1]|bits[0])
+
+    length = (length_bytes[0] << 7) | length_bytes[1]
+
+    # Read payload bytes
+    result = bytearray(length)
+    for byte_idx in range(2, length + 2):
+        bits = [0] * 8
+        for bit in range(7, -1, -1):
+            px_idx = byte_idx * 8 + (7 - bit)
+            bits[bit] = ((px[px_idx % w, px_idx // w][0] & 1) << bit)
+        result[byte_idx - 2] = (
+            bits[0]|bits[7]|bits[6]|bits[5]|bits[4]|bits[3]|bits[2]|bits[1])
+
+    return result.decode('utf-8')
+
+print(lsb_decode("/tmp/assets/app_sct_abroad.png"))
+# => PzEIWxPeAwuNF8sWRzc9
+```
+
+### 4. Bonus: AES Key for Additional Encryption
+
+There's also an AES key/IV pair hidden in `assets/pic_k_i.png` via the same LSB method:
+
+```json
+{"key": "a9m0d3enckEy$k3y", "iv": "aPm0dE3nc1v$##Iv"}
+```
+
+This is used by the app for encrypting certain API request payloads (the `uDesKey` field in `cloud_pro.ini`), not for login.
+
 # Work In Progress
-I am working on a way to automate camera parameters fetching just using the credentials. So, instead of populating the .env file with other variables, we would just need the username and password.
+
+Automating camera parameter fetching using just credentials — eliminating the need to manually populate product key/secret and device IDs in the `.env` file.
