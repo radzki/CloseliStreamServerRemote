@@ -979,9 +979,9 @@ class CameraManager:
         # add cameras that were powered on after startup.
         self._auth = None
 
-    def set_auth(self, device_uuid, email, token, uid, unified_id,
+    def set_auth(self, email, token, uid, unified_id,
                  product_key, product_secret):
-        self._auth = dict(device_uuid=device_uuid, email=email, token=token,
+        self._auth = dict(email=email, token=token,
                           uid=uid, unified_id=unified_id,
                           product_key=product_key, product_secret=product_secret)
 
@@ -1003,7 +1003,7 @@ class CameraManager:
                 if did in self.clients:
                     self.devices[did] = d  # name/status may have changed
                 else:
-                    if self.add_camera(d, self._auth['device_uuid'],
+                    if self.add_camera(d,
                                        self._auth['email'], self._auth['token'],
                                        self._auth['uid'], self._auth['unified_id'],
                                        self._auth['product_key'],
@@ -1018,11 +1018,16 @@ class CameraManager:
         return {"added": added, "reconnected": reconnected,
                 "total": len(self.clients)}
 
-    def add_camera(self, device_info, device_uuid, email, token, uid,
+    def add_camera(self, device_info, email, token, uid,
                    unified_id, product_key, product_secret):
         """Discover relay and create a client for one camera. Returns True if started."""
         device_id = device_info['deviceid']
         name = device_info.get('devicename', device_id)
+
+        # Each camera needs its own device_uuid — the relay only allows one
+        # active session per uuid, so sharing one across cameras causes them
+        # to kick each other off mid-auth in an endless loop.
+        device_uuid = f"ANDRC_{os.urandom(6).hex()}"
 
         relay_host, relay_port = None, None
         iplist = device_info.get('iplist', [])
@@ -1342,11 +1347,11 @@ def main():
 
     # Start cameras
     manager = CameraManager()
-    manager.set_auth(DEVICE_UUID, EMAIL, token, uid, unified_id,
+    manager.set_auth(EMAIL, token, uid, unified_id,
                      PRODUCT_KEY, PRODUCT_SECRET)
     started = 0
     for d in devices:
-        if manager.add_camera(d, DEVICE_UUID, EMAIL, token, uid,
+        if manager.add_camera(d, EMAIL, token, uid,
                               unified_id, PRODUCT_KEY, PRODUCT_SECRET):
             started += 1
 
