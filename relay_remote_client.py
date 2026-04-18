@@ -598,6 +598,9 @@ class RelayRemoteClient:
         self.video_broadcaster = StreamBroadcaster("video")
         self.audio_broadcaster = StreamBroadcaster("audio")
 
+        # Refresh signal: set by /refresh to force immediate rediscover + reconnect.
+        self.refresh_event = threading.Event()
+
     def connect(self):
         """Establish both relay connections and trigger video."""
         log(f"Connecting to {self.relay_host}:{self.relay_port}", "RELAY")
@@ -855,31 +858,63 @@ class RelayRemoteClient:
             if self.audio_count == 1:
                 log(f"Audio started ({len(data)}B)", "AUDIO")
 
+    def refresh(self):
+        """Force an immediate relay rediscovery + reconnect.
+
+        Used when the camera is powered on/off while the server is running
+        so the user doesn't have to wait out the reconnect backoff.
+        """
+        log(f"Refresh requested for {self.camera_id}", "RELAY")
+        self.refresh_event.set()
+        self.connected = False
+        for sock in (self.ctrl_sock, self.data_sock):
+            if sock:
+                try: sock.close()
+                except: pass
+
     def reconnect_loop(self):
-        """Auto-reconnecting wrapper."""
+        """Auto-reconnecting wrapper with relay rediscovery on each attempt."""
         retry = 0
         while retry < 50:
             if retry > 0:
                 wait = min(2 ** retry, 30)
-                log(f"Reconnecting in {wait}s (attempt #{retry})...", "WARN")
-                time.sleep(wait)
+                log(f"Reconnecting {self.camera_id} in {wait}s "
+                    f"(attempt #{retry})...", "WARN")
+                if self.refresh_event.wait(timeout=wait):
+                    log(f"Refresh interrupted backoff for {self.camera_id}", "RELAY")
+                    retry = 0
+            self.refresh_event.clear()
+
+            # Rediscover relay — camera may have moved or just come online.
+            try:
+                new_host, new_port = discover_relay(
+                    self.camera_id, self.product_key, self.product_secret)
+                if new_host:
+                    self.relay_host, self.relay_port = new_host, new_port
+                else:
+                    log(f"{self.camera_id} not on any relay (offline?)", "WARN")
+                    retry += 1
+                    continue
+            except Exception as e:
+                log(f"Rediscovery failed for {self.camera_id}: {e}", "ERROR")
+                retry += 1
+                continue
 
             try:
                 success = self.connect()
                 if success:
                     retry = 0
-                    # Wait until disconnected
-                    while self.connected:
+                    while self.connected and not self.refresh_event.is_set():
                         time.sleep(1)
             except Exception as e:
-                log(f"Connection failed: {e}", "ERROR")
+                log(f"Connection failed for {self.camera_id}: {e}", "ERROR")
 
             self.connected = False
             self.streaming = False
             self._close_sockets()
             retry += 1
 
-        log("Max retries exceeded", "ERROR")
+        log(f"Max retries exceeded for {self.camera_id}", "ERROR")
 
     def _close_sockets(self):
         for sock in [self.ctrl_sock, self.data_sock]:
@@ -939,6 +974,49 @@ class CameraManager:
         self.clients = {}   # device_id → RelayRemoteClient
         self.devices = {}   # device_id → device info dict from API
         self._threads = []
+        self._lock = threading.Lock()
+        # Auth context stashed so /refresh can re-fetch the device list and
+        # add cameras that were powered on after startup.
+        self._auth = None
+
+    def set_auth(self, device_uuid, email, token, uid, unified_id,
+                 product_key, product_secret):
+        self._auth = dict(device_uuid=device_uuid, email=email, token=token,
+                          uid=uid, unified_id=unified_id,
+                          product_key=product_key, product_secret=product_secret)
+
+    def refresh(self):
+        """Re-fetch device list, add newly-appeared cameras, kick disconnected
+        clients into an immediate reconnect. Returns a summary dict."""
+        if not self._auth:
+            return {"error": "auth not configured"}
+        try:
+            devices = get_device_list(self._auth['token'])
+        except Exception as e:
+            log(f"Refresh device list failed: {e}", "ERROR")
+            return {"error": f"device list failed: {e}"}
+
+        added, reconnected = [], []
+        with self._lock:
+            for d in devices:
+                did = d['deviceid']
+                if did in self.clients:
+                    self.devices[did] = d  # name/status may have changed
+                else:
+                    if self.add_camera(d, self._auth['device_uuid'],
+                                       self._auth['email'], self._auth['token'],
+                                       self._auth['uid'], self._auth['unified_id'],
+                                       self._auth['product_key'],
+                                       self._auth['product_secret']):
+                        added.append(did)
+
+            for did, cl in self.clients.items():
+                if not cl.connected:
+                    cl.refresh()
+                    reconnected.append(did)
+
+        return {"added": added, "reconnected": reconnected,
+                "total": len(self.clients)}
 
     def add_camera(self, device_info, device_uuid, email, token, uid,
                    unified_id, product_key, product_secret):
@@ -1063,6 +1141,15 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self._send_404("Camera not found")
                 return
             self._trigger_live_view(cl)
+        elif action == 'refresh':
+            if device_id:
+                cl = self._get_client(device_id)
+                if not cl:
+                    self._send_404("Camera not found")
+                    return
+                self._refresh_one(cl, device_id)
+            else:
+                self._refresh_all()
         else:
             self._serve_index()
 
@@ -1073,7 +1160,13 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         html = '<html><body>\n<h1>Closeli Remote Relay Client</h1>\n'
-        html += '<p><a href="/status">All cameras status (JSON)</a></p>\n<hr>\n'
+        html += '<p><a href="/status">All cameras status (JSON)</a></p>\n'
+        html += ('<p><button onclick="fetch(\'/refresh\')'
+                 '.then(r=>r.text()).then(t=>{'
+                 'document.getElementById(\'rmsg\').textContent=t;'
+                 'setTimeout(()=>location.reload(),1500)})">'
+                 'Refresh cameras</button> '
+                 '<span id="rmsg"></span></p>\n<hr>\n')
 
         if mgr:
             for did, client in mgr.clients.items():
@@ -1083,7 +1176,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                 html += f'<p><a href="/video/{did}">Video</a> | '
                 html += f'<a href="/audio/{did}">Audio</a> | '
                 html += f'<a href="/status/{did}">Status</a> | '
-                html += f'<a href="/trigger/{did}">Trigger</a></p>\n'
+                html += f'<a href="/trigger/{did}">Trigger</a> | '
+                html += f'<a href="/refresh/{did}">Refresh</a></p>\n'
                 html += f'<img src="/video/{did}" alt="{name}" style="max-width:640px">\n'
                 html += '<hr>\n'
 
@@ -1163,6 +1257,24 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(msg.encode())
 
+    def _refresh_all(self):
+        mgr = self.__class__.manager
+        result = mgr.refresh() if mgr else {"error": "not initialized"}
+        body = json.dumps(result, indent=2).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _refresh_one(self, cl, device_id):
+        cl.refresh()
+        msg = f"Refresh triggered for {device_id}"
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(msg.encode())
+
 
 # ============================================================================
 # Main
@@ -1230,6 +1342,8 @@ def main():
 
     # Start cameras
     manager = CameraManager()
+    manager.set_auth(DEVICE_UUID, EMAIL, token, uid, unified_id,
+                     PRODUCT_KEY, PRODUCT_SECRET)
     started = 0
     for d in devices:
         if manager.add_camera(d, DEVICE_UUID, EMAIL, token, uid,
@@ -1249,6 +1363,7 @@ def main():
         name = manager.devices[did].get('devicename', did)
         print(f"  Video:     http://localhost:{args.port}/video/{did}  ({name})")
     print(f"  Status:    http://localhost:{args.port}/status")
+    print(f"  Refresh:   http://localhost:{args.port}/refresh")
     print(f"  Index:     http://localhost:{args.port}/")
     print("=" * 70)
     print()
