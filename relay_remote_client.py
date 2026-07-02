@@ -569,7 +569,8 @@ def recv_relay_msg(sock, timeout=10):
 # ============================================================================
 class RelayRemoteClient:
     def __init__(self, relay_host, relay_port, camera_id, device_uuid,
-                 email, token, uid, unified_id, product_key, product_secret):
+                 email, token, uid, unified_id, product_key, product_secret,
+                 cam_unified_id=None):
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.camera_id = camera_id
@@ -578,6 +579,7 @@ class RelayRemoteClient:
         self.token = token
         self.uid = uid
         self.unified_id = unified_id
+        self.cam_unified_id = cam_unified_id or unified_id
         self.product_key = product_key
         self.product_secret = product_secret
 
@@ -631,7 +633,7 @@ class RelayRemoteClient:
         self.data_sock = create_tls_connection(self.relay_host, self.relay_port)
         auth2 = build_type2_auth(self.email, self.device_uuid, self.camera_id,
                                   self.token, self.product_key, self.product_secret,
-                                  self.unified_id)
+                                  self.cam_unified_id)
         send_relay_msg(self.data_sock, auth2)
 
         msg_type, fields, raw = recv_relay_msg(self.data_sock)
@@ -1052,6 +1054,7 @@ class CameraManager:
             email=email, token=token, uid=uid,
             unified_id=unified_id, product_key=product_key,
             product_secret=product_secret,
+            cam_unified_id=device_info.get('unifiedId', unified_id),
         )
         self.clients[device_id] = client
         self.devices[device_id] = device_info

@@ -40,6 +40,8 @@ Copy `.env.example` to `.env` and fill in:
 
 No per-camera configuration is needed — all cameras on the account are discovered automatically.
 
+**Note on shared cameras:** If your account has cameras shared by other users (`deviceSource: "receive"`), the client automatically uses the camera owner's `unifiedId` for relay authentication. This is required because the relay server rejects shared cameras when authenticated with the wrong `unifiedId` (error `result=2011`).
+
 ## Endpoints
 
 All cameras are served on a single port (default `8080`). Each camera's feed is accessed by its device ID:
@@ -230,3 +232,64 @@ There's also an AES key/IV pair hidden in `assets/pic_k_i.png` via the same LSB 
 ```
 
 This is used by the app for encrypting certain API request payloads (the `uDesKey` field in `cloud_pro.ini`), not for login.
+
+---
+
+## Extracting from YCC365 Plus APK
+
+YCC365 Plus (`com.ycc365plus.aws`) is another Closeli app with **different** credentials than Eoolii. It is also protected by **360 Jiagu**, but the credentials are stored differently.
+
+### YCC365 Plus Credentials
+
+| Region | Product Key | Product Secret |
+|---|---|---|
+| Global | `6f425be2-e27` | `WXKGtS0yQuMd6uqxq5KR` |
+
+### 1. Product Key (plaintext!)
+
+The product key is stored in **plaintext** in `res/xDY.ini` — no decompiler needed:
+
+```bash
+unzip YCC365+Plus.apk res/xDY.ini
+cat res/xDY.ini
+```
+
+Output:
+```ini
+[key]
+Key = 6f425be2-e27
+QRKey = e1
+Secret = WXKGtS0yQuMd6uqxq5KR
+UPNSSendId = 34038106032
+ModelId = eyeplus_001
+[general]
+Channel = YCC365Plus_global_android
+ClientCode = 1042
+```
+
+### 2. Product Secret (same LSB steganography)
+
+Same method as Eoolii — extract from `assets/app_sct.png`:
+
+```bash
+unzip YCC365+Plus.apk assets/app_sct.png
+python3 -c "
+from PIL import Image
+img = Image.open('assets/app_sct.png')
+# ... use lsb_decode() from above ...
+"
+```
+
+Result: `WXKGtS0yQuMd6uqxq5KR`
+
+### 3. AES Key/IV
+
+Same as Eoolii — extract from `assets/pic_k_i.png`:
+
+```json
+{"key": "a9m0d3enckEy$k3y", "iv": "aPm0dE3nc1v$##Iv"}
+```
+
+### Why `res/xDY.ini` is easier
+
+The Eoolii product key is in `BuildConfig.java` which requires jadx decompilation. YCC365 Plus stores it in `res/xDY.ini` — a simple ZIP extraction works even when 360 Jiagu encrypts the DEX files.
