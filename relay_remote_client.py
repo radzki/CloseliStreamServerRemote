@@ -70,11 +70,6 @@ DEVICE_UUID = f"ANDRC_{os.urandom(6).hex()}"
 API_HOST = "api.icloseli.com"
 ESD_HOST = "esd.icloseli.com"
 
-# Safety cap for reassembling a JPEG split across MediaPackages (see
-# RelayRemoteClient._handle_media_package). Frames are normally < 1 MB; this
-# only guards against a runaway buffer if an end-of-image marker never arrives.
-MAX_VIDEO_FRAME = 4 * 1024 * 1024
-
 # Colors
 class C:
     H = '\033[95m'; B = '\033[94m'; G = '\033[92m'; Y = '\033[93m'
@@ -544,36 +539,12 @@ def send_relay_msg(sock, protobuf_msg):
     sock.sendall(struct.pack('>I', len(protobuf_msg)) + protobuf_msg)
 
 
-def _recv_with_deadline(sock, n, deadline):
-    """recv up to n bytes, bounded by an absolute time.monotonic() deadline.
-    Returns b'' on timeout or close so the caller aborts the current frame."""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return b''
-    sock.settimeout(remaining)
-    try:
-        return sock.recv(n)
-    except socket.timeout:
-        return b''
-
-
 def recv_relay_msg(sock, timeout=10):
-    """Receive one length-prefixed protobuf message → (msg_type, fields, raw).
-
-    A timeout while *waiting for a message to start* propagates as socket.timeout
-    so the caller can use it as a keepalive-ping cue. Once a frame has started,
-    the rest is read to completion under a bounded deadline; a stall or close
-    mid-frame returns (None, None, None) to force a clean reconnect rather than
-    leaving a half-consumed message that would desync every read after it.
-    """
+    """Receive one length-prefixed protobuf message. Returns (msg_type, fields, raw)."""
     sock.settimeout(timeout)
-    header = sock.recv(4)          # socket.timeout here is the caller's ping cue
-    if not header:
-        return None, None, None
-
-    deadline = time.monotonic() + max(timeout, 10)
+    header = b''
     while len(header) < 4:
-        chunk = _recv_with_deadline(sock, 4 - len(header), deadline)
+        chunk = sock.recv(4 - len(header))
         if not chunk:
             return None, None, None
         header += chunk
@@ -582,14 +553,13 @@ def recv_relay_msg(sock, timeout=10):
     if msg_len > 2 * 1024 * 1024:
         return None, None, None
 
-    data = bytearray()
+    data = b''
     while len(data) < msg_len:
-        chunk = _recv_with_deadline(sock, min(msg_len - len(data), 65536), deadline)
+        chunk = sock.recv(min(msg_len - len(data), 65536))
         if not chunk:
-            return None, None, None
+            break
         data += chunk
 
-    data = bytes(data)
     fields = decode_protobuf(data)
     msg_type = fields.get(1)
     return msg_type, fields, data
@@ -626,7 +596,6 @@ class RelayRemoteClient:
         # Video - latest_frame for snapshot, broadcaster for MJPEG streaming
         self.video_lock = threading.Lock()
         self.latest_frame = None
-        self._video_buf = None   # partial JPEG spanning MediaPackages (data thread only)
         self.video_broadcaster = StreamBroadcaster("video")
         self.audio_broadcaster = StreamBroadcaster("audio")
 
@@ -864,30 +833,20 @@ class RelayRemoteClient:
             return
 
         if pkg_type == 2:  # Video (MJPEG)
-            soi = data.find(b'\xff\xd8')
-            if soi >= 0:
-                eoi = data.rfind(b'\xff\xd9')
-                if eoi > soi:
-                    # Whole frame in one package — the common case.
-                    self._video_buf = None
-                    self._emit_frame(data[soi:eoi + 2], sync)
-                else:
-                    # Frame starts here but has no end marker yet — buffer it.
-                    self._video_buf = bytearray(data[soi:])
-            elif self._video_buf is not None:
-                # Continuation of a frame split across packages.
-                self._video_buf += data
-                eoi = self._video_buf.rfind(b'\xff\xd9')
-                if eoi >= 0:
-                    frame = bytes(self._video_buf[:eoi + 2])
-                    self._video_buf = None
-                    self._emit_frame(frame, sync)
-                elif len(self._video_buf) > MAX_VIDEO_FRAME:
-                    log(f"Dropping oversized video frame "
-                        f"({len(self._video_buf)}B, no end marker)", "WARN")
-                    self._video_buf = None
+            jpeg_start = data.find(b'\xff\xd8')
+            if jpeg_start >= 0:
+                jpeg_end = data.rfind(b'\xff\xd9')
+                end_pos = jpeg_end + 2 if jpeg_end >= 0 else len(data)
+                jpeg_data = data[jpeg_start:end_pos]
+                with self.video_lock:
+                    self.latest_frame = jpeg_data
+                self.video_broadcaster.broadcast(jpeg_data)
+                self.frame_count += 1
+                if self.frame_count % 30 == 0:
+                    log(f"Frame {self.frame_count} ({len(jpeg_data)}B, "
+                        f"sync={sync})", "VIDEO")
             else:
-                # No start marker and nothing buffered → not JPEG (encrypted/H.264).
+                # Might be encrypted or H.264
                 self.frame_count += 1
                 if self.frame_count <= 3 or self.frame_count % 100 == 0:
                     log(f"Video #{seq_num}: {len(data)}B (first: {data[:8].hex()})",
@@ -898,15 +857,6 @@ class RelayRemoteClient:
             self.audio_count += 1
             if self.audio_count == 1:
                 log(f"Audio started ({len(data)}B)", "AUDIO")
-
-    def _emit_frame(self, jpeg_data, sync):
-        """Publish one complete JPEG frame to snapshot + MJPEG listeners."""
-        with self.video_lock:
-            self.latest_frame = jpeg_data
-        self.video_broadcaster.broadcast(jpeg_data)
-        self.frame_count += 1
-        if self.frame_count % 30 == 0:
-            log(f"Frame {self.frame_count} ({len(jpeg_data)}B, sync={sync})", "VIDEO")
 
     def get_latest_frame(self):
         """Most recent complete JPEG frame, or None if none received yet."""
