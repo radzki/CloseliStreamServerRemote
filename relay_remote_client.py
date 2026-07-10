@@ -760,8 +760,22 @@ class RelayRemoteClient:
     def _data_loop(self):
         """Data channel loop: receive MediaPackage and other messages."""
         log("Data loop started", "DATA")
+        last_ping = time.time()
 
         while self.connected:
+            # Keepalive: the relay closes the data connection after ~60s without
+            # any client->server traffic. MediaPackages and ServerCmds stream in
+            # almost continuously, so the recv() below rarely times out — send a
+            # ping on a fixed timer regardless of incoming traffic. Verified
+            # against the relay: without this the connection is reaped at ~60-75s.
+            if time.time() - last_ping > 20:
+                try:
+                    send_relay_msg(self.data_sock, build_ping())
+                    last_ping = time.time()
+                except Exception as e:
+                    log(f"Data ping failed: {e}", "ERROR")
+                    break
+
             try:
                 msg_type, fields, raw = recv_relay_msg(self.data_sock, timeout=5)
 
@@ -796,12 +810,7 @@ class RelayRemoteClient:
                         f"{len(raw) if raw else 0}B", "DATA")
 
             except socket.timeout:
-                # Send ping on data channel too
-                try:
-                    send_relay_msg(self.data_sock, build_ping())
-                except Exception as e:
-                    log(f"Data ping failed: {e}", "ERROR")
-                    break
+                pass  # keepalive ping is handled at the top of the loop
             except Exception as e:
                 log(f"Data error: {e}", "ERROR")
                 break
