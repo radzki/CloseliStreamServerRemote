@@ -19,6 +19,7 @@ Endpoints:
   http://localhost:8080/                        - Index (all cameras)
   http://localhost:8080/video/<device_id>       - MJPEG video stream
   http://localhost:8080/audio/<device_id>       - WAV audio stream
+  http://localhost:8080/snapshot/<device_id>    - Latest single JPEG frame
   http://localhost:8080/status                  - All cameras status JSON
   http://localhost:8080/status/<device_id>      - Single camera status
 """
@@ -761,9 +762,22 @@ class RelayRemoteClient:
     def _data_loop(self):
         """Data channel loop: receive MediaPackage and other messages."""
         log("Data loop started", "DATA")
-        head_len = 4  # from type=6 auth response field 7
+        last_ping = time.time()
 
         while self.connected:
+            # Keepalive: the relay closes the data connection after ~60s without
+            # any client->server traffic. MediaPackages and ServerCmds stream in
+            # almost continuously, so the recv() below rarely times out — send a
+            # ping on a fixed timer regardless of incoming traffic. Verified
+            # against the relay: without this the connection is reaped at ~60-75s.
+            if time.time() - last_ping > 20:
+                try:
+                    send_relay_msg(self.data_sock, build_ping())
+                    last_ping = time.time()
+                except Exception as e:
+                    log(f"Data ping failed: {e}", "ERROR")
+                    break
+
             try:
                 msg_type, fields, raw = recv_relay_msg(self.data_sock, timeout=5)
 
@@ -798,12 +812,7 @@ class RelayRemoteClient:
                         f"{len(raw) if raw else 0}B", "DATA")
 
             except socket.timeout:
-                # Send ping on data channel too
-                try:
-                    send_relay_msg(self.data_sock, build_ping())
-                except Exception as e:
-                    log(f"Data ping failed: {e}", "ERROR")
-                    break
+                pass  # keepalive ping is handled at the top of the loop
             except Exception as e:
                 log(f"Data error: {e}", "ERROR")
                 break
@@ -860,6 +869,11 @@ class RelayRemoteClient:
             if self.audio_count == 1:
                 log(f"Audio started ({len(data)}B)", "AUDIO")
 
+    def get_latest_frame(self):
+        """Most recent complete JPEG frame, or None if none received yet."""
+        with self.video_lock:
+            return self.latest_frame
+
     def refresh(self):
         """Force an immediate relay rediscovery + reconnect.
 
@@ -875,11 +889,16 @@ class RelayRemoteClient:
                 except: pass
 
     def reconnect_loop(self):
-        """Auto-reconnecting wrapper with relay rediscovery on each attempt."""
+        """Auto-reconnecting wrapper with relay rediscovery on each attempt.
+
+        Runs for the lifetime of the process: a powered-off camera keeps
+        retrying with capped backoff until it returns, so the thread is never
+        orphaned and /refresh always has a live loop to wake up.
+        """
         retry = 0
-        while retry < 50:
+        while True:
             if retry > 0:
-                wait = min(2 ** retry, 30)
+                wait = min(2 ** min(retry, 6), 60)
                 log(f"Reconnecting {self.camera_id} in {wait}s "
                     f"(attempt #{retry})...", "WARN")
                 if self.refresh_event.wait(timeout=wait):
@@ -915,8 +934,6 @@ class RelayRemoteClient:
             self.streaming = False
             self._close_sockets()
             retry += 1
-
-        log(f"Max retries exceeded for {self.camera_id}", "ERROR")
 
     def _close_sockets(self):
         for sock in [self.ctrl_sock, self.data_sock]:
@@ -998,24 +1015,35 @@ class CameraManager:
             log(f"Refresh device list failed: {e}", "ERROR")
             return {"error": f"device list failed: {e}"}
 
-        added, reconnected = [], []
+        # Update info for known cameras and pick out the new ones under the lock,
+        # but run relay discovery (network I/O, inside add_camera) *outside* it so
+        # a slow lookup for one offline camera can't block status pages or other
+        # refreshes.
         with self._lock:
+            new_devices = []
             for d in devices:
                 did = d['deviceid']
                 if did in self.clients:
                     self.devices[did] = d  # name/status may have changed
                 else:
-                    if self.add_camera(d,
-                                       self._auth['email'], self._auth['token'],
-                                       self._auth['uid'], self._auth['unified_id'],
-                                       self._auth['product_key'],
-                                       self._auth['product_secret']):
-                        added.append(did)
+                    new_devices.append(d)
 
-            for did, cl in self.clients.items():
-                if not cl.connected:
-                    cl.refresh()
-                    reconnected.append(did)
+        added = []
+        for d in new_devices:
+            if self.add_camera(d,
+                               self._auth['email'], self._auth['token'],
+                               self._auth['uid'], self._auth['unified_id'],
+                               self._auth['product_key'],
+                               self._auth['product_secret']):
+                added.append(d['deviceid'])
+
+        reconnected = []
+        with self._lock:
+            clients = list(self.clients.items())
+        for did, cl in clients:
+            if not cl.connected:
+                cl.refresh()
+                reconnected.append(did)
 
         return {"added": added, "reconnected": reconnected,
                 "total": len(self.clients)}
@@ -1056,8 +1084,13 @@ class CameraManager:
             product_secret=product_secret,
             cam_unified_id=device_info.get('unifiedId', unified_id),
         )
-        self.clients[device_id] = client
-        self.devices[device_id] = device_info
+
+        with self._lock:
+            if device_id in self.clients:
+                # A concurrent refresh already added it — don't start a duplicate.
+                return False
+            self.clients[device_id] = client
+            self.devices[device_id] = device_info
 
         t = threading.Thread(target=client.reconnect_loop, daemon=True,
                              name=f"relay-{device_id}")
@@ -1067,12 +1100,26 @@ class CameraManager:
         return True
 
     def get_client(self, device_id):
-        return self.clients.get(device_id)
+        with self._lock:
+            return self.clients.get(device_id)
+
+    def get_single_client(self):
+        """Return the sole client when exactly one camera exists, else None."""
+        with self._lock:
+            if len(self.clients) == 1:
+                return next(iter(self.clients.values()))
+            return None
+
+    def snapshot(self):
+        """[(device_id, client, device_info)] captured under the lock so callers
+        can iterate without racing add_camera()."""
+        with self._lock:
+            return [(did, cl, self.devices.get(did, {}))
+                    for did, cl in self.clients.items()]
 
     def get_status(self):
         cameras = []
-        for did, client in self.clients.items():
-            info = self.devices.get(did, {})
+        for did, client, info in self.snapshot():
             s = client.get_status()
             s['devicename'] = info.get('devicename', '')
             cameras.append(s)
@@ -1097,9 +1144,10 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def _parse_path(self):
         """Parse /<action>/<device_id> from path. Returns (action, device_id_or_None)."""
-        parts = self.path.strip('/').split('/', 1)
+        path = urllib.parse.urlparse(self.path).path
+        parts = path.strip('/').split('/', 1)
         action = parts[0] if parts else ''
-        device_id = parts[1] if len(parts) > 1 else None
+        device_id = urllib.parse.unquote(parts[1]) if len(parts) > 1 else None
         return action, device_id
 
     def _get_client(self, device_id):
@@ -1109,9 +1157,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             return None
         if device_id:
             return mgr.get_client(device_id)
-        if len(mgr.clients) == 1:
-            return next(iter(mgr.clients.values()))
-        return None
+        return mgr.get_single_client()
 
     def _send_404(self, msg="Not found"):
         self.send_response(404)
@@ -1134,6 +1180,12 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self._send_404("Camera not found")
                 return
             self._serve_audio(cl)
+        elif action == 'snapshot':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._serve_snapshot(cl)
         elif action == 'status':
             if device_id:
                 cl = self._get_client(device_id)
@@ -1177,12 +1229,13 @@ class StreamHandler(BaseHTTPRequestHandler):
                  '<span id="rmsg"></span></p>\n<hr>\n')
 
         if mgr:
-            for did, client in mgr.clients.items():
-                name = mgr.devices.get(did, {}).get('devicename', did)
+            for did, client, info in mgr.snapshot():
+                name = info.get('devicename', did)
                 status = 'connected' if client.connected else 'disconnected'
                 html += f'<h2>{name} <small>({did}) [{status}]</small></h2>\n'
                 html += f'<p><a href="/video/{did}">Video</a> | '
                 html += f'<a href="/audio/{did}">Audio</a> | '
+                html += f'<a href="/snapshot/{did}">Snapshot</a> | '
                 html += f'<a href="/status/{did}">Status</a> | '
                 html += f'<a href="/trigger/{did}">Trigger</a> | '
                 html += f'<a href="/refresh/{did}">Refresh</a></p>\n'
@@ -1235,6 +1288,20 @@ class StreamHandler(BaseHTTPRequestHandler):
         except: pass
         finally:
             cl.audio_broadcaster.remove_listener(q)
+
+    def _serve_snapshot(self, cl):
+        frame = cl.get_latest_frame()
+        if not frame:
+            self._send_404("No frame available yet")
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(frame)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        try:
+            self.wfile.write(frame)
+        except: pass
 
     def _serve_camera_status(self, cl):
         body = json.dumps(cl.get_status(), indent=2).encode('utf-8')

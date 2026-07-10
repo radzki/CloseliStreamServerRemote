@@ -51,6 +51,7 @@ All cameras are served on a single port (default `8080`). Each camera's feed is 
 | `/` | Index page — lists all cameras with live previews |
 | `/video/<device_id>` | MJPEG video stream for a specific camera |
 | `/audio/<device_id>` | WAV audio stream (G.711 A-law, 8kHz mono) |
+| `/snapshot/<device_id>` | Latest single JPEG frame (still image) |
 | `/status` | JSON status for all cameras |
 | `/status/<device_id>` | JSON status for a specific camera |
 | `/trigger/<device_id>` | Re-send LIVE_VIEW command to a specific camera |
