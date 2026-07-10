@@ -598,6 +598,7 @@ class RelayRemoteClient:
         # Video - latest_frame for snapshot, broadcaster for MJPEG streaming
         self.video_lock = threading.Lock()
         self.latest_frame = None
+        self.last_video_ts = 0.0  # updated on every video package; drives the stall watchdog
         self.video_broadcaster = StreamBroadcaster("video")
         self.audio_broadcaster = StreamBroadcaster("audio")
 
@@ -764,6 +765,18 @@ class RelayRemoteClient:
         log("Data loop started", "DATA")
         last_ping = time.time()
 
+        # Video-stall watchdog. After a "primary viewer" preemption (ServerCmd
+        # sub-cmd 44) the relay may reconnect the data socket but never resume
+        # sending video, leaving a live-but-silent channel that the socket-close
+        # detection can't catch — the stream just stays black. If no video
+        # arrives for STALL_RELIVE, re-assert LIVE_VIEW (cheap reclaim); if it's
+        # still silent at STALL_RECONNECT, tear the session down so
+        # reconnect_loop rediscovers the relay and re-auths from scratch.
+        STALL_RELIVE = 20     # s of no video -> re-send LIVE_VIEW
+        STALL_RECONNECT = 40  # s of no video -> force full reconnect
+        self.last_video_ts = time.time()  # grace: give the fresh session time to produce frames
+        relive_sent = False
+
         while self.connected:
             # Keepalive: the relay closes the data connection after ~60s without
             # any client->server traffic. MediaPackages and ServerCmds stream in
@@ -777,6 +790,18 @@ class RelayRemoteClient:
                 except Exception as e:
                     log(f"Data ping failed: {e}", "ERROR")
                     break
+
+            stalled = time.time() - self.last_video_ts
+            if stalled > STALL_RECONNECT:
+                log(f"No video for {int(stalled)}s — forcing reconnect", "WARN")
+                break
+            if stalled > STALL_RELIVE:
+                if not relive_sent:
+                    log(f"No video for {int(stalled)}s — re-asserting LIVE_VIEW", "WARN")
+                    self._send_live_view()
+                    relive_sent = True
+            else:
+                relive_sent = False  # video is flowing again; re-arm the escalation
 
             try:
                 msg_type, fields, raw = recv_relay_msg(self.data_sock, timeout=5)
@@ -803,7 +828,19 @@ class RelayRemoteClient:
                             msg_info = msg_info.hex()[:80]
                     log(f"Data XMPP: {str(msg_info)[:200]}", "DATA")
                 elif msg_type == 7:  # SERVERCMD
-                    log(f"Data ServerCmd: {raw[:40].hex() if raw else '?'}", "DATA")
+                    sc = decode_protobuf(fields.get(8, b'')) if isinstance(fields.get(8), bytes) else {}
+                    if sc.get(2) == 44:  # "primary viewer" preemption notice
+                        reason = sc.get(4)
+                        note = sc.get(6, b'')
+                        if isinstance(note, bytes):
+                            try:
+                                note = note.decode('utf-8')
+                            except Exception:
+                                note = note.hex()
+                        log(f"Preempted by another live viewer (reason={reason}): "
+                            f"{str(note)[:200]} — relay will drop the data channel", "WARN")
+                    else:
+                        log(f"Data ServerCmd: {raw[:40].hex() if raw else '?'}", "DATA")
                 elif msg_type == 3:  # START
                     log("START message received - camera is sending!", "OK")
                     self.streaming = True
@@ -844,6 +881,7 @@ class RelayRemoteClient:
             return
 
         if pkg_type == 2:  # Video (MJPEG)
+            self.last_video_ts = time.time()  # liveness signal for the stall watchdog
             jpeg_start = data.find(b'\xff\xd8')
             if jpeg_start >= 0:
                 jpeg_end = data.rfind(b'\xff\xd9')
