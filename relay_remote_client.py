@@ -19,6 +19,7 @@ Endpoints:
   http://localhost:8080/                        - Index (all cameras)
   http://localhost:8080/video/<device_id>       - MJPEG video stream
   http://localhost:8080/audio/<device_id>       - WAV audio stream
+  http://localhost:8080/snapshot/<device_id>    - Latest single JPEG frame
   http://localhost:8080/status                  - All cameras status JSON
   http://localhost:8080/status/<device_id>      - Single camera status
 """
@@ -68,6 +69,11 @@ DEVICE_UUID = f"ANDRC_{os.urandom(6).hex()}"
 
 API_HOST = "api.icloseli.com"
 ESD_HOST = "esd.icloseli.com"
+
+# Safety cap for reassembling a JPEG split across MediaPackages (see
+# RelayRemoteClient._handle_media_package). Frames are normally < 1 MB; this
+# only guards against a runaway buffer if an end-of-image marker never arrives.
+MAX_VIDEO_FRAME = 4 * 1024 * 1024
 
 # Colors
 class C:
@@ -538,12 +544,36 @@ def send_relay_msg(sock, protobuf_msg):
     sock.sendall(struct.pack('>I', len(protobuf_msg)) + protobuf_msg)
 
 
+def _recv_with_deadline(sock, n, deadline):
+    """recv up to n bytes, bounded by an absolute time.monotonic() deadline.
+    Returns b'' on timeout or close so the caller aborts the current frame."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return b''
+    sock.settimeout(remaining)
+    try:
+        return sock.recv(n)
+    except socket.timeout:
+        return b''
+
+
 def recv_relay_msg(sock, timeout=10):
-    """Receive one length-prefixed protobuf message. Returns (msg_type, fields, raw)."""
+    """Receive one length-prefixed protobuf message → (msg_type, fields, raw).
+
+    A timeout while *waiting for a message to start* propagates as socket.timeout
+    so the caller can use it as a keepalive-ping cue. Once a frame has started,
+    the rest is read to completion under a bounded deadline; a stall or close
+    mid-frame returns (None, None, None) to force a clean reconnect rather than
+    leaving a half-consumed message that would desync every read after it.
+    """
     sock.settimeout(timeout)
-    header = b''
+    header = sock.recv(4)          # socket.timeout here is the caller's ping cue
+    if not header:
+        return None, None, None
+
+    deadline = time.monotonic() + max(timeout, 10)
     while len(header) < 4:
-        chunk = sock.recv(4 - len(header))
+        chunk = _recv_with_deadline(sock, 4 - len(header), deadline)
         if not chunk:
             return None, None, None
         header += chunk
@@ -552,13 +582,14 @@ def recv_relay_msg(sock, timeout=10):
     if msg_len > 2 * 1024 * 1024:
         return None, None, None
 
-    data = b''
+    data = bytearray()
     while len(data) < msg_len:
-        chunk = sock.recv(min(msg_len - len(data), 65536))
+        chunk = _recv_with_deadline(sock, min(msg_len - len(data), 65536), deadline)
         if not chunk:
-            break
+            return None, None, None
         data += chunk
 
+    data = bytes(data)
     fields = decode_protobuf(data)
     msg_type = fields.get(1)
     return msg_type, fields, data
@@ -595,6 +626,7 @@ class RelayRemoteClient:
         # Video - latest_frame for snapshot, broadcaster for MJPEG streaming
         self.video_lock = threading.Lock()
         self.latest_frame = None
+        self._video_buf = None   # partial JPEG spanning MediaPackages (data thread only)
         self.video_broadcaster = StreamBroadcaster("video")
         self.audio_broadcaster = StreamBroadcaster("audio")
 
@@ -759,7 +791,6 @@ class RelayRemoteClient:
     def _data_loop(self):
         """Data channel loop: receive MediaPackage and other messages."""
         log("Data loop started", "DATA")
-        head_len = 4  # from type=6 auth response field 7
 
         while self.connected:
             try:
@@ -833,20 +864,30 @@ class RelayRemoteClient:
             return
 
         if pkg_type == 2:  # Video (MJPEG)
-            jpeg_start = data.find(b'\xff\xd8')
-            if jpeg_start >= 0:
-                jpeg_end = data.rfind(b'\xff\xd9')
-                end_pos = jpeg_end + 2 if jpeg_end >= 0 else len(data)
-                jpeg_data = data[jpeg_start:end_pos]
-                with self.video_lock:
-                    self.latest_frame = jpeg_data
-                self.video_broadcaster.broadcast(jpeg_data)
-                self.frame_count += 1
-                if self.frame_count % 30 == 0:
-                    log(f"Frame {self.frame_count} ({len(jpeg_data)}B, "
-                        f"sync={sync})", "VIDEO")
+            soi = data.find(b'\xff\xd8')
+            if soi >= 0:
+                eoi = data.rfind(b'\xff\xd9')
+                if eoi > soi:
+                    # Whole frame in one package — the common case.
+                    self._video_buf = None
+                    self._emit_frame(data[soi:eoi + 2], sync)
+                else:
+                    # Frame starts here but has no end marker yet — buffer it.
+                    self._video_buf = bytearray(data[soi:])
+            elif self._video_buf is not None:
+                # Continuation of a frame split across packages.
+                self._video_buf += data
+                eoi = self._video_buf.rfind(b'\xff\xd9')
+                if eoi >= 0:
+                    frame = bytes(self._video_buf[:eoi + 2])
+                    self._video_buf = None
+                    self._emit_frame(frame, sync)
+                elif len(self._video_buf) > MAX_VIDEO_FRAME:
+                    log(f"Dropping oversized video frame "
+                        f"({len(self._video_buf)}B, no end marker)", "WARN")
+                    self._video_buf = None
             else:
-                # Might be encrypted or H.264
+                # No start marker and nothing buffered → not JPEG (encrypted/H.264).
                 self.frame_count += 1
                 if self.frame_count <= 3 or self.frame_count % 100 == 0:
                     log(f"Video #{seq_num}: {len(data)}B (first: {data[:8].hex()})",
@@ -857,6 +898,20 @@ class RelayRemoteClient:
             self.audio_count += 1
             if self.audio_count == 1:
                 log(f"Audio started ({len(data)}B)", "AUDIO")
+
+    def _emit_frame(self, jpeg_data, sync):
+        """Publish one complete JPEG frame to snapshot + MJPEG listeners."""
+        with self.video_lock:
+            self.latest_frame = jpeg_data
+        self.video_broadcaster.broadcast(jpeg_data)
+        self.frame_count += 1
+        if self.frame_count % 30 == 0:
+            log(f"Frame {self.frame_count} ({len(jpeg_data)}B, sync={sync})", "VIDEO")
+
+    def get_latest_frame(self):
+        """Most recent complete JPEG frame, or None if none received yet."""
+        with self.video_lock:
+            return self.latest_frame
 
     def refresh(self):
         """Force an immediate relay rediscovery + reconnect.
@@ -873,11 +928,16 @@ class RelayRemoteClient:
                 except: pass
 
     def reconnect_loop(self):
-        """Auto-reconnecting wrapper with relay rediscovery on each attempt."""
+        """Auto-reconnecting wrapper with relay rediscovery on each attempt.
+
+        Runs for the lifetime of the process: a powered-off camera keeps
+        retrying with capped backoff until it returns, so the thread is never
+        orphaned and /refresh always has a live loop to wake up.
+        """
         retry = 0
-        while retry < 50:
+        while True:
             if retry > 0:
-                wait = min(2 ** retry, 30)
+                wait = min(2 ** min(retry, 6), 60)
                 log(f"Reconnecting {self.camera_id} in {wait}s "
                     f"(attempt #{retry})...", "WARN")
                 if self.refresh_event.wait(timeout=wait):
@@ -913,8 +973,6 @@ class RelayRemoteClient:
             self.streaming = False
             self._close_sockets()
             retry += 1
-
-        log(f"Max retries exceeded for {self.camera_id}", "ERROR")
 
     def _close_sockets(self):
         for sock in [self.ctrl_sock, self.data_sock]:
@@ -996,24 +1054,35 @@ class CameraManager:
             log(f"Refresh device list failed: {e}", "ERROR")
             return {"error": f"device list failed: {e}"}
 
-        added, reconnected = [], []
+        # Update info for known cameras and pick out the new ones under the lock,
+        # but run relay discovery (network I/O, inside add_camera) *outside* it so
+        # a slow lookup for one offline camera can't block status pages or other
+        # refreshes.
         with self._lock:
+            new_devices = []
             for d in devices:
                 did = d['deviceid']
                 if did in self.clients:
                     self.devices[did] = d  # name/status may have changed
                 else:
-                    if self.add_camera(d,
-                                       self._auth['email'], self._auth['token'],
-                                       self._auth['uid'], self._auth['unified_id'],
-                                       self._auth['product_key'],
-                                       self._auth['product_secret']):
-                        added.append(did)
+                    new_devices.append(d)
 
-            for did, cl in self.clients.items():
-                if not cl.connected:
-                    cl.refresh()
-                    reconnected.append(did)
+        added = []
+        for d in new_devices:
+            if self.add_camera(d,
+                               self._auth['email'], self._auth['token'],
+                               self._auth['uid'], self._auth['unified_id'],
+                               self._auth['product_key'],
+                               self._auth['product_secret']):
+                added.append(d['deviceid'])
+
+        reconnected = []
+        with self._lock:
+            clients = list(self.clients.items())
+        for did, cl in clients:
+            if not cl.connected:
+                cl.refresh()
+                reconnected.append(did)
 
         return {"added": added, "reconnected": reconnected,
                 "total": len(self.clients)}
@@ -1053,8 +1122,13 @@ class CameraManager:
             unified_id=unified_id, product_key=product_key,
             product_secret=product_secret,
         )
-        self.clients[device_id] = client
-        self.devices[device_id] = device_info
+
+        with self._lock:
+            if device_id in self.clients:
+                # A concurrent refresh already added it — don't start a duplicate.
+                return False
+            self.clients[device_id] = client
+            self.devices[device_id] = device_info
 
         t = threading.Thread(target=client.reconnect_loop, daemon=True,
                              name=f"relay-{device_id}")
@@ -1064,12 +1138,26 @@ class CameraManager:
         return True
 
     def get_client(self, device_id):
-        return self.clients.get(device_id)
+        with self._lock:
+            return self.clients.get(device_id)
+
+    def get_single_client(self):
+        """Return the sole client when exactly one camera exists, else None."""
+        with self._lock:
+            if len(self.clients) == 1:
+                return next(iter(self.clients.values()))
+            return None
+
+    def snapshot(self):
+        """[(device_id, client, device_info)] captured under the lock so callers
+        can iterate without racing add_camera()."""
+        with self._lock:
+            return [(did, cl, self.devices.get(did, {}))
+                    for did, cl in self.clients.items()]
 
     def get_status(self):
         cameras = []
-        for did, client in self.clients.items():
-            info = self.devices.get(did, {})
+        for did, client, info in self.snapshot():
             s = client.get_status()
             s['devicename'] = info.get('devicename', '')
             cameras.append(s)
@@ -1094,9 +1182,10 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def _parse_path(self):
         """Parse /<action>/<device_id> from path. Returns (action, device_id_or_None)."""
-        parts = self.path.strip('/').split('/', 1)
+        path = urllib.parse.urlparse(self.path).path
+        parts = path.strip('/').split('/', 1)
         action = parts[0] if parts else ''
-        device_id = parts[1] if len(parts) > 1 else None
+        device_id = urllib.parse.unquote(parts[1]) if len(parts) > 1 else None
         return action, device_id
 
     def _get_client(self, device_id):
@@ -1106,9 +1195,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             return None
         if device_id:
             return mgr.get_client(device_id)
-        if len(mgr.clients) == 1:
-            return next(iter(mgr.clients.values()))
-        return None
+        return mgr.get_single_client()
 
     def _send_404(self, msg="Not found"):
         self.send_response(404)
@@ -1131,6 +1218,12 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self._send_404("Camera not found")
                 return
             self._serve_audio(cl)
+        elif action == 'snapshot':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._serve_snapshot(cl)
         elif action == 'status':
             if device_id:
                 cl = self._get_client(device_id)
@@ -1174,12 +1267,13 @@ class StreamHandler(BaseHTTPRequestHandler):
                  '<span id="rmsg"></span></p>\n<hr>\n')
 
         if mgr:
-            for did, client in mgr.clients.items():
-                name = mgr.devices.get(did, {}).get('devicename', did)
+            for did, client, info in mgr.snapshot():
+                name = info.get('devicename', did)
                 status = 'connected' if client.connected else 'disconnected'
                 html += f'<h2>{name} <small>({did}) [{status}]</small></h2>\n'
                 html += f'<p><a href="/video/{did}">Video</a> | '
                 html += f'<a href="/audio/{did}">Audio</a> | '
+                html += f'<a href="/snapshot/{did}">Snapshot</a> | '
                 html += f'<a href="/status/{did}">Status</a> | '
                 html += f'<a href="/trigger/{did}">Trigger</a> | '
                 html += f'<a href="/refresh/{did}">Refresh</a></p>\n'
@@ -1232,6 +1326,20 @@ class StreamHandler(BaseHTTPRequestHandler):
         except: pass
         finally:
             cl.audio_broadcaster.remove_listener(q)
+
+    def _serve_snapshot(self, cl):
+        frame = cl.get_latest_frame()
+        if not frame:
+            self._send_404("No frame available yet")
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(frame)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        try:
+            self.wfile.write(frame)
+        except: pass
 
     def _serve_camera_status(self, cl):
         body = json.dumps(cl.get_status(), indent=2).encode('utf-8')
