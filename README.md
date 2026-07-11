@@ -117,9 +117,15 @@ cameras:
       password: <device_id>    # any value; not checked
 ```
 
-**Manual pan/tilt d-pad only** — no zoom, presets, or autotracking (the camera has no
-position/FOV feedback, which Frigate's autotracking requires). Needs `lxml` (in
-`requirements.txt`).
+**What you get in Frigate:** the manual pan/tilt **d-pad** (arrow controls) in the camera
+view, plus the `frigate/<camera>/ptz` MQTT topic (`MOVE_UP/DOWN/LEFT/RIGHT`, `STOP`).
+
+**What you do NOT get — leave autotracking off:** no zoom, no presets, and **no
+autotracking or click-to-move**. Those require FOV `RelativeMove` + live position /
+`MoveStatus` feedback, which this camera cannot provide. Do **not** set
+`onvif: autotracking: enabled: true` — Frigate will just disable it at startup (logging
+`Disabling autotracking … FOV relative movement not supported`). The plain d-pad is the
+whole feature. Requires `lxml` (in `requirements.txt`).
 
 ## Running Without Docker
 
