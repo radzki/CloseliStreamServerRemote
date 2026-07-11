@@ -961,7 +961,10 @@ class RelayRemoteClient:
             self.last_video_ts = time.time()  # liveness signal for the stall watchdog
             jpeg_start = data.find(b'\xff\xd8')
             if jpeg_start >= 0:
-                jpeg_end = data.rfind(b'\xff\xd9')
+                # Search for EOI only after SOI: a stray FF D9 in a prefix before
+                # the SOI would otherwise make jpeg_end < jpeg_start and yield an
+                # empty slice.
+                jpeg_end = data.rfind(b'\xff\xd9', jpeg_start)
                 if jpeg_end >= 0:
                     jpeg_data = data[jpeg_start:jpeg_end + 2]    # clean SOI..EOI, drop trailer
                 else:
