@@ -212,6 +212,15 @@ def get_profiles():
     bounds = etree.SubElement(vsc, f"{{{NS['tt']}}}Bounds")
     for k, v in (("x", "0"), ("y", "0"), ("width", "960"), ("height", "540")):
         bounds.set(k, v)
+    # Frigate only treats a profile as PTZ-capable if it ALSO has a
+    # VideoEncoderConfiguration (frigate/ptz/onvif.py valid_profiles filter).
+    vec = etree.SubElement(profile, f"{{{NS['tt']}}}VideoEncoderConfiguration", token=VIDEO_ENCODER_TOKEN)
+    etree.SubElement(vec, f"{{{NS['tt']}}}Name").text = "VideoEncoder"
+    etree.SubElement(vec, f"{{{NS['tt']}}}UseCount").text = "1"
+    etree.SubElement(vec, f"{{{NS['tt']}}}Encoding").text = "H264"
+    res = etree.SubElement(vec, f"{{{NS['tt']}}}Resolution")
+    etree.SubElement(res, f"{{{NS['tt']}}}Width").text = "960"
+    etree.SubElement(res, f"{{{NS['tt']}}}Height").text = "540"
     _build_ptz_config(profile)
     return _envelope(resp)
 
