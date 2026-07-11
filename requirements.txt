@@ -1,1 +1,2 @@
 pycryptodome==3.23.0
+lxml>=5.0        # only needed when ONVIF PTZ is enabled (see ONVIF_* in .env)

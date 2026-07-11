@@ -7,5 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY relay_remote_client.py .
 COPY index.html .
+COPY onvif_ptz.py .
 
 CMD ["python3", "-u", "relay_remote_client.py"]
