@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Closeli Relay Client</title>
+<style>
+  :root { color-scheme: light dark; }   /* follow the OS light/dark setting */
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 0; padding: 1rem; background: Canvas; color: CanvasText; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  .sub { opacity: .6; font-size: .85rem; margin-bottom: 1rem; }
+  .cams { display: flex; flex-wrap: wrap; gap: 1rem; }
+  .cam { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+         border-radius: 12px; padding: .75rem; width: min(100%, 680px); }
+  .cam h2 { font-size: 1rem; margin: 0 0 .5rem; display: flex; align-items: center; gap: .5rem; }
+  .badge { font-size: .7rem; font-weight: 600; padding: .1rem .5rem; border-radius: 999px;
+           border: 1px solid currentColor; }
+  .up   { color: #16a34a; }      /* connected */
+  .down { color: #dc2626; }      /* disconnected */
+  .id { opacity: .5; font-weight: 400; font-size: .8rem; }
+  .feed { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 16/9;
+          object-fit: contain; display: block; }
+  .row { display: flex; gap: 1rem; align-items: center; margin-top: .6rem; flex-wrap: wrap; }
+  /* PTZ d-pad */
+  .pad { display: grid; grid-template-columns: repeat(3, 48px);
+         grid-template-rows: repeat(3, 48px); gap: 6px; }
+  .pad button { font-size: 1.1rem; border-radius: 8px; cursor: pointer; border: 1px solid
+                color-mix(in srgb, CanvasText 30%, transparent); background: transparent;
+                color: CanvasText; touch-action: none; user-select: none; }
+  .pad button:active { background: color-mix(in srgb, CanvasText 15%, transparent); }
+  .pad .u { grid-area: 1 / 2; } .pad .l { grid-area: 2 / 1; }
+  .pad .s { grid-area: 2 / 2; } .pad .r { grid-area: 2 / 3; } .pad .d { grid-area: 3 / 2; }
+  .links a { font-size: .85rem; margin-right: .75rem; }
+  .meta { font-size: .8rem; opacity: .7; }
+  .hint { font-size: .78rem; opacity: .6; margin-top: .4rem; }
+</style>
+</head>
+<body>
+  <h1>Closeli Relay Client</h1>
+  <div class="sub">Hold a PTZ arrow to move, release to stop.
+    <a href="#" onclick="refreshAll(event)">refresh cameras</a></div>
+  <div class="cams" id="cams">loading…</div>
+
+<script>
+const DIRS = [['u','▲','up'],['l','◄','left'],['s','■','stop'],['r','►','right'],['d','▼','down']];
+const SAFETY_MS = 8000;   // auto-stop if a release event is ever missed
+// Render the MJPEG feed into a <canvas> (fully-decoded frames only → no blinking).
+// Fall back to a plain <img> stream if the browser lacks the streaming APIs.
+const STREAMING = !!(window.createImageBitmap && window.ReadableStream && window.TextDecoder);
+
+// Device names/ids come from external camera metadata; escape before putting them
+// in HTML so a hostile name can't inject markup/script.
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function ptz(id, dir, extra='') {
+  return fetch(`/ptz/${encodeURIComponent(id)}?dir=${dir}${extra}`).catch(()=>{});
+}
+
+function makePad(id) {
+  const pad = document.createElement('div');
+  pad.className = 'pad';
+  let safety = null;
+  const stop = () => { clearTimeout(safety); safety = null; ptz(id, 'stop'); };
+  for (const [cls, glyph, dir] of DIRS) {
+    const b = document.createElement('button');
+    b.className = cls; b.textContent = glyph; b.title = dir;
+    if (dir === 'stop') {
+      b.addEventListener('click', () => ptz(id, 'stop'));
+    } else {
+      const start = (e) => { e.preventDefault(); clearTimeout(safety);
+        safety = setTimeout(stop, SAFETY_MS); ptz(id, dir, '&continuous=1'); };
+      b.addEventListener('pointerdown', start);
+      b.addEventListener('pointerup', stop);
+      b.addEventListener('pointerleave', stop);
+      b.addEventListener('pointercancel', stop);
+    }
+    pad.appendChild(b);
+  }
+  // safety: if the window loses focus mid-hold, stop.
+  window.addEventListener('blur', stop);
+  return pad;
+}
+
+function card(cam) {
+  const id = cam.camera_id;
+  const el = document.createElement('div');
+  el.className = 'cam'; el.dataset.id = id;
+  el.innerHTML =
+    `<h2><span>${esc(cam.devicename || id)}</span>
+       <span class="badge ${cam.connected ? 'up' : 'down'}" data-badge>
+         ${cam.connected ? 'connected' : 'offline'}</span>
+       <span class="id">${esc(id)}</span></h2>
+     ${STREAMING ? '<canvas class="feed"></canvas>'
+                 : `<img class="feed" src="/video/${encodeURIComponent(id)}" alt="${esc(id)}">`}
+     <div class="row"><div class="meta" data-meta></div></div>`;
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.appendChild(makePad(id));
+  const links = document.createElement('div');
+  links.className = 'links';
+  links.innerHTML =
+    `<a href="/status/${encodeURIComponent(id)}" target="_blank">status</a>
+     <a href="/audio/${encodeURIComponent(id)}" target="_blank">audio</a>
+     <a href="#" data-refresh>refresh</a>`;
+  links.querySelector('[data-refresh]').addEventListener('click', (e) => {
+    e.preventDefault(); fetch('/refresh/' + encodeURIComponent(id)).catch(()=>{}); });
+  row.appendChild(links);
+  el.appendChild(row);
+  el.insertAdjacentHTML('beforeend', '<div class="hint">Tip: click ■ any time to force stop.</div>');
+  updateMeta(el, cam);
+  if (STREAMING) playStream(el.querySelector('canvas.feed'), id);
+  return el;
+}
+
+// The relay's JPEG frames often lack a clean FF D9 end-marker (trailing padding).
+// Browsers usually decode them anyway, but guarantee a well-formed SOI..EOI so
+// createImageBitmap never rejects a frame. Trim to the real EOI if present, else append one.
+function ensureEOI(u8) {
+  for (let i = u8.length - 2; i >= 0; i--) {
+    if (u8[i] === 0xFF && u8[i + 1] === 0xD9) return u8.subarray(0, i + 2);
+  }
+  const out = new Uint8Array(u8.length + 2);
+  out.set(u8, 0); out[u8.length] = 0xFF; out[u8.length + 1] = 0xD9;
+  return out;
+}
+
+// Find byte sequence `seq` in `buf` starting at `from`; -1 if absent.
+function findSeq(buf, seq, from) {
+  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+// Parse the multipart/x-mixed-replace MJPEG stream and draw each fully-decoded
+// frame to the canvas. Because a frame is only drawn once createImageBitmap has
+// decoded it, the canvas never shows a blank/partial frame — no blinking.
+async function playStream(canvas, id) {
+  const ctx = canvas.getContext('2d');
+  const HDR_END = [13, 10, 13, 10];   // \r\n\r\n
+  const dec = new TextDecoder();
+  for (;;) {
+    try {
+      const resp = await fetch(`/video/${encodeURIComponent(id)}`, { cache: 'no-store' });
+      if (!resp.ok || !resp.body) throw new Error('no stream');
+      const reader = resp.body.getReader();
+      let buf = new Uint8Array(0);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0); merged.set(value, buf.length); buf = merged;
+        for (;;) {
+          const he = findSeq(buf, HDR_END, 0);
+          if (he === -1) break;
+          const m = /content-length:\s*(\d+)/i.exec(dec.decode(buf.subarray(0, he)));
+          if (!m) { buf = buf.subarray(he + 4); continue; }   // skip malformed part
+          const len = +m[1], start = he + 4;
+          if (buf.length < start + len) break;                // wait for the rest
+          const jpeg = ensureEOI(buf.subarray(start, start + len));
+          try {
+            const bmp = await createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
+            if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height; }
+            ctx.drawImage(bmp, 0, 0);
+            bmp.close && bmp.close();
+          } catch (_) { /* drop undecodable frame, keep the last good one */ }
+          buf = buf.subarray(start + len);
+        }
+        if (buf.length > 8 * 1024 * 1024) buf = new Uint8Array(0);   // desync guard
+      }
+    } catch (_) { /* fall through and reconnect */ }
+    await new Promise(r => setTimeout(r, 1000));   // brief pause, then reconnect
+  }
+}
+
+function updateMeta(el, cam) {
+  const badge = el.querySelector('[data-badge]');
+  badge.textContent = cam.connected ? 'connected' : 'offline';
+  badge.className = 'badge ' + (cam.connected ? 'up' : 'down');
+  el.querySelector('[data-meta]').textContent =
+    `relay ${cam.relay || '?'} · ${cam.frame_count ?? 0} frames · up ${cam.uptime ?? 0}s`;
+}
+
+async function load() {
+  let data;
+  try { data = await (await fetch('/status')).json(); }
+  catch { document.getElementById('cams').textContent = 'server unreachable'; return; }
+  const cams = data.cameras || [];
+  const host = document.getElementById('cams');
+  if (!cams.length) { host.textContent = 'no cameras'; return; }
+  // build cards once; afterwards only patch the status text so the video isn't torn down.
+  if (!host.querySelector('.cam')) {
+    host.textContent = '';
+    for (const c of cams) host.appendChild(card(c));
+  } else {
+    for (const c of cams) {
+      const el = host.querySelector(`.cam[data-id="${CSS.escape(c.camera_id)}"]`);
+      if (el) updateMeta(el, c);
+    }
+  }
+}
+
+function refreshAll(e) { if (e) e.preventDefault(); fetch('/refresh').catch(()=>{}); }
+
+load();
+setInterval(load, 5000);   // patch status badges/meta; leaves the MJPEG feeds alone
+</script>
+</body>
+</html>
