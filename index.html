@@ -50,6 +50,11 @@ const SAFETY_MS = 8000;   // auto-stop if a release event is ever missed
 // Fall back to a plain <img> stream if the browser lacks the streaming APIs.
 const STREAMING = !!(window.createImageBitmap && window.ReadableStream && window.TextDecoder);
 
+// Device names/ids come from external camera metadata; escape before putting them
+// in HTML so a hostile name can't inject markup/script.
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 function ptz(id, dir, extra='') {
   return fetch(`/ptz/${encodeURIComponent(id)}?dir=${dir}${extra}`).catch(()=>{});
 }
@@ -84,12 +89,12 @@ function card(cam) {
   const el = document.createElement('div');
   el.className = 'cam'; el.dataset.id = id;
   el.innerHTML =
-    `<h2><span>${cam.devicename || id}</span>
+    `<h2><span>${esc(cam.devicename || id)}</span>
        <span class="badge ${cam.connected ? 'up' : 'down'}" data-badge>
          ${cam.connected ? 'connected' : 'offline'}</span>
-       <span class="id">${id}</span></h2>
+       <span class="id">${esc(id)}</span></h2>
      ${STREAMING ? '<canvas class="feed"></canvas>'
-                 : `<img class="feed" src="/video/${encodeURIComponent(id)}" alt="${id}">`}
+                 : `<img class="feed" src="/video/${encodeURIComponent(id)}" alt="${esc(id)}">`}
      <div class="row"><div class="meta" data-meta></div></div>`;
   const row = document.createElement('div');
   row.className = 'row';
@@ -97,11 +102,11 @@ function card(cam) {
   const links = document.createElement('div');
   links.className = 'links';
   links.innerHTML =
-    `<a href="/status/${id}" target="_blank">status</a>
-     <a href="/audio/${id}" target="_blank">audio</a>
+    `<a href="/status/${encodeURIComponent(id)}" target="_blank">status</a>
+     <a href="/audio/${encodeURIComponent(id)}" target="_blank">audio</a>
      <a href="#" data-refresh>refresh</a>`;
   links.querySelector('[data-refresh]').addEventListener('click', (e) => {
-    e.preventDefault(); fetch('/refresh/' + id).catch(()=>{}); });
+    e.preventDefault(); fetch('/refresh/' + encodeURIComponent(id)).catch(()=>{}); });
   row.appendChild(links);
   el.appendChild(row);
   el.insertAdjacentHTML('beforeend', '<div class="hint">Tip: click ■ any time to force stop.</div>');
