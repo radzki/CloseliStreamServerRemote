@@ -321,6 +321,56 @@ def build_clientcmd_live_view(camera_id, device_uuid):
     return msg
 
 
+# PTZ direction -> wire value. From the decompiled app's XmppDef.PtzValue_LensPan*
+# constants, confirmed against Frida captures of request=1793/subRequest=82:
+#   left=1, right=2, up=3, down=4, stop=0
+# The move is CONTINUOUS: the camera keeps moving until a value=0 (stop) is sent.
+PTZ_VALUES = {
+    'left': 1,    # PtzValue_LensPanLeft
+    'right': 2,   # PtzValue_LensPanRight
+    'up': 3,      # PtzValue_LensPanUp
+    'down': 4,    # PtzValue_LensPanDown
+    'stop': 0,    # PtzValue_LensPanContinueStop
+}
+
+
+def build_clientcmd_ptz(camera_id, device_uuid, value):
+    """Build PTZ move 1793/82 as CLIENTCMD (type=9, field 10).
+
+    Mirrors build_clientcmd_live_view — identical envelope and field1=33 framing;
+    only msgContent changes. Exact format from Frida capture of the real app:
+      msgContent { request=1793(Request_Set), subRequest=82(PTZ),
+                   channelName="720p", requestParams={"value": <dir>} }
+    where value is a PtzValue_LensPan* code (see PTZ_VALUES): 1=left, 2=right,
+    3=up, 4=down, 0=stop.
+    """
+    import random
+    msg_session = random.randint(10000000, 99999999)
+    payload = json.dumps({
+        "msgSession": msg_session,
+        "msgSequence": 0,
+        "msgCategory": "camera",
+        "msgTimeStamp": int(time.time() * 1000),
+        "msgContent": {
+            "request": 1793,
+            "subRequest": 82,
+            "channelName": "720p",
+            "requestParams": {"value": value},
+        },
+    }, separators=(',', ':'))
+
+    # ClientCmd sub-message (goes in field 10 of RelayMessage)
+    cc = pb_varint(1, 33)                             # sub-type = 33 (0x21)
+    cc += pb_string(2, camera_id)                      # destination = camera
+    cc += pb_string(5, payload)                        # JSON payload
+    cc += pb_varint(10, msg_session)                   # session ID
+
+    # RelayMessage
+    msg = pb_varint(1, 9)                              # message_type = CLIENTCMD(9)
+    msg += pb_submsg(10, cc)                            # field 10 = ClientCmd
+    return msg
+
+
 def build_clientcmd_handshake(device_uuid):
     """Build handshake CLIENTCMD (type=9, sub-type=1).
 
@@ -718,6 +768,23 @@ class RelayRemoteClient:
         except Exception as e:
             log(f"LIVE_VIEW failed: {e}", "ERROR")
 
+    def _send_ptz(self, value):
+        """Send one PTZ move 1793/82 via the control connection.
+
+        Modeled on _send_live_view: CLIENTCMD (type=9) sub-type=33, sent through
+        _ctrl_send so it is serialized against ping/pong and live-view writes.
+        `value` is a PtzValue_LensPan* code (1=left 2=right 3=up 4=down 0=stop).
+        Returns True if the frame was written to the socket, False on error.
+        """
+        try:
+            log(f"Sending PTZ 1793/82 value={value} via ctrl (CLIENTCMD)...", "XMPP")
+            msg = build_clientcmd_ptz(self.camera_id, self.device_uuid, value)
+            self._ctrl_send(msg)
+            return True
+        except Exception as e:
+            log(f"PTZ failed: {e}", "ERROR")
+            return False
+
     def _ctrl_loop(self):
         """Control channel loop: ping/pong + XMPP message forwarding."""
         log("Control loop started", "XMPP")
@@ -895,8 +962,13 @@ class RelayRemoteClient:
             jpeg_start = data.find(b'\xff\xd8')
             if jpeg_start >= 0:
                 jpeg_end = data.rfind(b'\xff\xd9')
-                end_pos = jpeg_end + 2 if jpeg_end >= 0 else len(data)
-                jpeg_data = data[jpeg_start:end_pos]
+                if jpeg_end >= 0:
+                    jpeg_data = data[jpeg_start:jpeg_end + 2]    # clean SOI..EOI, drop trailer
+                else:
+                    # The relay often omits the EOI marker (frame ends in padding). All
+                    # image MCUs are present, so append EOI to hand every consumer a
+                    # well-formed JPEG (ffmpeg/Frigate, /snapshot, browser canvas).
+                    jpeg_data = data[jpeg_start:] + b'\xff\xd9'
                 with self.video_lock:
                     self.latest_frame = jpeg_data
                 self.video_broadcaster.broadcast(jpeg_data)
@@ -1213,6 +1285,16 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(msg.encode())
 
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, indent=2).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except: pass
+
     def do_GET(self):
         action, device_id = self._parse_path()
 
@@ -1249,6 +1331,12 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self._send_404("Camera not found")
                 return
             self._trigger_live_view(cl)
+        elif action == 'ptz':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            self._ptz(cl)
         elif action == 'refresh':
             if device_id:
                 cl = self._get_client(device_id)
@@ -1262,36 +1350,28 @@ class StreamHandler(BaseHTTPRequestHandler):
             self._serve_index()
 
     def _serve_index(self):
-        mgr = self.__class__.manager
+        """Serve the static control UI (index.html next to this script).
+
+        The page fetches /status and drives the /video, /ptz and /refresh
+        endpoints in JavaScript — no HTML is assembled in Python. Falls back to a
+        minimal page if the file is missing (e.g. not copied into the container).
+        """
+        index_path = Path(__file__).parent / 'index.html'
+        try:
+            body = index_path.read_bytes()
+        except OSError:
+            body = (b'<!DOCTYPE html><meta charset="utf-8"><title>Closeli Relay</title>'
+                    b'<h1>Closeli Relay Client</h1>'
+                    b'<p>index.html not found next to relay_remote_client.py.</p>'
+                    b'<p>API: <a href="/status">/status</a>, /video/&lt;id&gt;, '
+                    b'/ptz/&lt;id&gt;?dir=left|right|up|down|stop</p>')
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-
-        html = '<html><body>\n<h1>Closeli Remote Relay Client</h1>\n'
-        html += '<p><a href="/status">All cameras status (JSON)</a></p>\n'
-        html += ('<p><button onclick="fetch(\'/refresh\')'
-                 '.then(r=>r.text()).then(t=>{'
-                 'document.getElementById(\'rmsg\').textContent=t;'
-                 'setTimeout(()=>location.reload(),1500)})">'
-                 'Refresh cameras</button> '
-                 '<span id="rmsg"></span></p>\n<hr>\n')
-
-        if mgr:
-            for did, client, info in mgr.snapshot():
-                name = info.get('devicename', did)
-                status = 'connected' if client.connected else 'disconnected'
-                html += f'<h2>{name} <small>({did}) [{status}]</small></h2>\n'
-                html += f'<p><a href="/video/{did}">Video</a> | '
-                html += f'<a href="/audio/{did}">Audio</a> | '
-                html += f'<a href="/snapshot/{did}">Snapshot</a> | '
-                html += f'<a href="/status/{did}">Status</a> | '
-                html += f'<a href="/trigger/{did}">Trigger</a> | '
-                html += f'<a href="/refresh/{did}">Refresh</a></p>\n'
-                html += f'<img src="/video/{did}" alt="{name}" style="max-width:640px">\n'
-                html += '<hr>\n'
-
-        html += '</body></html>'
-        self.wfile.write(html.encode())
+        try:
+            self.wfile.write(body)
+        except: pass
 
     def _serve_mjpeg(self, cl):
         self.send_response(200)
@@ -1379,6 +1459,54 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
         self.wfile.write(msg.encode())
+
+    def _ptz(self, cl):
+        """Handle GET /ptz/<device_id>?dir=<left|right|up|down|stop>[&ms=N][&continuous=1].
+
+        Directions map to PtzValue_LensPan* codes (PTZ_VALUES) and are sent as
+        1793/82 on the control channel. The camera moves CONTINUOUSLY until it
+        receives stop(0), so a directional request performs a discrete "nudge":
+        send the move, wait `ms` (default 500, clamped 0..3000), then send stop.
+        Pass continuous=1 to send the move only (you must then call ?dir=stop).
+        dir=stop just sends stop(0).
+        """
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        direction = (qs.get('dir', [''])[0] or '').strip().lower()
+
+        if direction not in PTZ_VALUES:
+            self._send_json({"error": "bad or missing dir",
+                             "valid": sorted(PTZ_VALUES)}, status=400)
+            return
+        if not cl.connected:
+            self._send_json({"error": "camera not connected",
+                             "device": cl.camera_id}, status=503)
+            return
+
+        value = PTZ_VALUES[direction]
+
+        # dir=stop is a bare stop frame.
+        if direction == 'stop':
+            ok = cl._send_ptz(0)
+            self._send_json({"device": cl.camera_id, "dir": "stop",
+                             "value": 0, "sent": ok})
+            return
+
+        continuous = qs.get('continuous', ['0'])[0].lower() in ('1', 'true', 'yes')
+        try:
+            ms = int(qs.get('ms', ['500'])[0])
+        except (ValueError, TypeError):
+            ms = 500
+        ms = max(0, min(ms, 3000))
+
+        ok = cl._send_ptz(value)
+        result = {"device": cl.camera_id, "dir": direction, "value": value,
+                  "sent": ok, "continuous": continuous}
+        if not continuous:
+            if ms:
+                time.sleep(ms / 1000.0)
+            result["nudge_ms"] = ms
+            result["stopped"] = cl._send_ptz(0)
+        self._send_json(result)
 
     def _refresh_all(self):
         mgr = self.__class__.manager
@@ -1487,6 +1615,7 @@ def main():
         print(f"  Video:     http://localhost:{args.port}/video/{did}  ({name})")
     print(f"  Status:    http://localhost:{args.port}/status")
     print(f"  Refresh:   http://localhost:{args.port}/refresh")
+    print(f"  PTZ:       http://localhost:{args.port}/ptz/<id>?dir=left|right|up|down|stop")
     print(f"  Index:     http://localhost:{args.port}/")
     print("=" * 70)
     print()
