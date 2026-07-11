@@ -86,6 +86,41 @@ streams:
 
 The MJPEG stream is delivered at the camera's native framerate (~8fps) with proper frame pacing.
 
+### PTZ control via ONVIF
+
+Frigate controls PTZ only over ONVIF, and these cameras have no native ONVIF. Enabling
+ONVIF starts **one** ONVIF PTZ listener (embedded in this process) shared by all cameras.
+It translates Frigate's `ContinuousMove`/`Stop` into the `/ptz/<device_id>` endpoint, and
+picks the camera from the ONVIF **username** — so every camera points at the same port and
+sets `onvif.user` to its device id (`onvif.password` can be anything).
+
+In `.env`:
+
+```bash
+ONVIF_ENABLED=true
+ONVIF_PORT=8091      # one port, shared by all cameras
+```
+
+In Frigate — same `host`/`port` for every camera, `user` = that camera's device id:
+
+```yaml
+cameras:
+  patio:
+    ffmpeg:
+      inputs:
+        - path: http://<host>:8080/video/<device_id>   # video via go2rtc
+          roles: [detect]
+    onvif:
+      host: <host>
+      port: 8091               # same for all cameras
+      user: <device_id>        # selects the camera
+      password: <device_id>    # any value; not checked
+```
+
+**Manual pan/tilt d-pad only** — no zoom, presets, or autotracking (the camera has no
+position/FOV feedback, which Frigate's autotracking requires). Needs `lxml` (in
+`requirements.txt`).
+
 ## Running Without Docker
 
 ```bash

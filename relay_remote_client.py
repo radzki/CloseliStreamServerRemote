@@ -70,6 +70,13 @@ DEVICE_UUID = f"ANDRC_{os.urandom(6).hex()}"
 API_HOST = "api.icloseli.com"
 ESD_HOST = "esd.icloseli.com"
 
+# ONVIF PTZ (optional) — exposes cameras to Frigate as ONVIF PTZ devices so their
+# manual pan/tilt d-pad works (Frigate only speaks ONVIF for PTZ). ONE shared
+# ONVIF port serves all cameras; Frigate selects a camera by setting its
+# onvif.user to the device id. Off by default; requires lxml.
+ONVIF_ENABLED = os.environ.get("ONVIF_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+ONVIF_PORT = int(os.environ.get("ONVIF_PORT", "8091"))
+
 # Colors
 class C:
     H = '\033[95m'; B = '\033[94m'; G = '\033[92m'; Y = '\033[93m'
@@ -1623,6 +1630,26 @@ def main():
     print("=" * 70)
     print()
 
+    # Optional shared ONVIF PTZ listener so Frigate can drive pan/tilt (Frigate
+    # only speaks ONVIF for PTZ). ONE port serves all cameras; Frigate selects a
+    # camera by setting its onvif.user to the device id. It calls back into this
+    # process's own /ptz route, reusing all the PTZ logic. See ONVIF_* in .env.
+    onvif_server = None
+    if ONVIF_ENABLED:
+        try:
+            import onvif_ptz
+        except ImportError as e:
+            log(f"ONVIF enabled but lxml/onvif_ptz unavailable ({e}); skipping", "WARN")
+        else:
+            try:
+                onvif_server = onvif_ptz.start_onvif_server(
+                    ONVIF_PORT, f"http://127.0.0.1:{args.port}", "onvif")
+                print(f"  ONVIF:     http://<host>:{ONVIF_PORT}  "
+                      f"(all cameras; set Frigate onvif.user=<device_id>)")
+            except Exception as e:
+                log(f"ONVIF listener on :{ONVIF_PORT} failed: {e}", "ERROR")
+        print()
+
     server = ThreadingHTTPServer(('0.0.0.0', args.port), StreamHandler)
     log(f"HTTP server on port {args.port}", "OK")
 
@@ -1632,6 +1659,11 @@ def main():
         print("\nShutting down...")
     finally:
         manager.disconnect_all()
+        if onvif_server:
+            try:
+                onvif_server.shutdown()
+            except Exception:
+                pass
         server.shutdown()
 
 
