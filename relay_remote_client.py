@@ -587,6 +587,11 @@ class RelayRemoteClient:
         # Sockets
         self.ctrl_sock = None   # type=6 (XMPP/control)
         self.data_sock = None   # type=2 (video/audio)
+        # ctrl_sock is written from several threads (ctrl loop ping/pong, the
+        # HTTP /trigger handler, and the data loop's stall watchdog). sendall()
+        # loops on partial writes, so concurrent writers can interleave and
+        # corrupt the length-prefixed framing — serialize them.
+        self.ctrl_send_lock = threading.Lock()
 
         # State
         self.connected = False
@@ -616,7 +621,7 @@ class RelayRemoteClient:
         self.ctrl_sock = create_tls_connection(self.relay_host, self.relay_port)
         auth6 = build_type6_auth(self.email, self.device_uuid, self.token,
                                   self.product_key, self.uid, self.unified_id)
-        send_relay_msg(self.ctrl_sock, auth6)
+        self._ctrl_send(auth6)
 
         msg_type, fields, raw = recv_relay_msg(self.ctrl_sock)
         if msg_type != 2:  # RESPONSE
@@ -695,6 +700,11 @@ class RelayRemoteClient:
         time.sleep(0.2)
         self._send_live_view()
 
+    def _ctrl_send(self, msg):
+        """Send a framed message on ctrl_sock, serialized against other threads."""
+        with self.ctrl_send_lock:
+            send_relay_msg(self.ctrl_sock, msg)
+
     def _send_live_view(self):
         """Send LIVE_VIEW 1792/222 via control connection.
 
@@ -704,7 +714,7 @@ class RelayRemoteClient:
         try:
             log("Sending LIVE_VIEW 1792/222 via ctrl (CLIENTCMD)...", "XMPP")
             lv = build_clientcmd_live_view(self.camera_id, self.device_uuid)
-            send_relay_msg(self.ctrl_sock, lv)
+            self._ctrl_send(lv)
         except Exception as e:
             log(f"LIVE_VIEW failed: {e}", "ERROR")
 
@@ -725,7 +735,7 @@ class RelayRemoteClient:
                     continue
 
                 if msg_type == 5:  # PING
-                    send_relay_msg(self.ctrl_sock, build_pong())
+                    self._ctrl_send(build_pong())
                     log(f"Ctrl PING/PONG", "XMPP")
                 elif msg_type == 6:  # PONG (response to our ping)
                     pass  # expected
@@ -748,7 +758,7 @@ class RelayRemoteClient:
                 # Send our own ping periodically
                 if time.time() - last_ping > 25:
                     try:
-                        send_relay_msg(self.ctrl_sock, build_ping())
+                        self._ctrl_send(build_ping())
                         last_ping = time.time()
                     except Exception as e:
                         log(f"Ping failed: {e}", "ERROR")
