@@ -4,6 +4,9 @@ Standalone client that connects to Closeli (Eoolii/Taismart) cloud relay servers
 
 All cameras on your account are **auto-discovered** and served through a **single HTTP port** (default `8080`), with each camera's feed accessible by its device ID.
 
+<img width="736" height="716" alt="620322800-32c9ee26-3e0d-4f5b-946a-592215811a20" src="https://github.com/user-attachments/assets/f1f35f63-14b0-4b7c-b904-2468f0b043c1" />
+
+
 ## How It Works
 
 The client reverse-engineers the Closeli relay protocol:
