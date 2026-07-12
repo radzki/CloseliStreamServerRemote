@@ -1,4 +1,4 @@
-# Closeli Remote Stream Server
+# Closeli/YCC365 Plus/Eoolii Remote Stream Server
 
 Standalone client that connects to Closeli (Eoolii/Taismart) cloud relay servers to receive camera MJPEG video and audio streams. No LAN access to the camera required — works from anywhere with internet.
 
