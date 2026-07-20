@@ -1420,9 +1420,16 @@ class StreamHandler(BaseHTTPRequestHandler):
         hdr += b'data\xff\xff\xff\xff'
         self.wfile.write(hdr)
         q = cl.audio_broadcaster.add_listener()
+        silence = b'\xd5' * 4000  # 0.5s of 8kHz A-law silence (0xD5 = a-law zero)
         try:
             while True:
-                self.wfile.write(q.get(timeout=5.0))
+                try:
+                    data = q.get(timeout=0.5)
+                except queue.Empty:
+                    # Relay is reconnecting — feed silence at real-time rate to
+                    # keep go2rtc's ffmpeg alive, mirroring the MJPEG handler.
+                    data = silence
+                self.wfile.write(data)
         except: pass
         finally:
             cl.audio_broadcaster.remove_listener(q)
