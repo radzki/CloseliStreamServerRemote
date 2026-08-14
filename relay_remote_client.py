@@ -315,9 +315,38 @@ def build_clientcmd_live_view(camera_id, device_uuid):
     cc += pb_varint(10, msg_session)                   # session ID
 
     # RelayMessage
+# PTZ direction mapping -> Protobuf value
+PTZ_VALUES = {"left": 1, "right": 2, "up": 3, "down": 4, "stop": 0}
+
+def build_clientcmd_ptz(camera_id, device_uuid, value):
+    """Build PTZ control command (type=9, field 10, request=1793, subRequest=82).
+
+    value: 1=left, 2=right, 3=up, 4=down, 0=stop
+    """
+    import random
+    msg_session = random.randint(10000000, 99999999)
+    payload = json.dumps({
+        "msgSession": msg_session,
+        "msgSequence": 0,
+        "msgCategory": "camera",
+        "msgTimeStamp": int(time.time() * 1000),
+        "msgContent": {
+            "request": 1793,
+            "subRequest": 82,
+            "channelName": "720p",
+            "requestParams": {"value": value},
+        },
+    }, separators=(',', ':'))
+
+    cc = pb_varint(1, 33)                             # sub-type = 33 (0x21)
+    cc += pb_string(2, camera_id)                      # destination = camera
+    cc += pb_string(5, payload)                        # JSON payload
+    cc += pb_varint(10, msg_session)                   # session ID
+
     msg = pb_varint(1, 9)                              # message_type = CLIENTCMD(9)
     msg += pb_submsg(10, cc)                            # field 10 = ClientCmd
     return msg
+
 
 
 def build_clientcmd_handshake(device_uuid):
@@ -852,11 +881,24 @@ class RelayRemoteClient:
                     log(f"Video #{seq_num}: {len(data)}B (first: {data[:8].hex()})",
                         "VIDEO")
 
-        elif pkg_type == 1:  # Audio
-            self.audio_broadcaster.broadcast(data)
-            self.audio_count += 1
-            if self.audio_count == 1:
-                log(f"Audio started ({len(data)}B)", "AUDIO")
+    def send_ptz(self, direction):
+        """Send PTZ command over control socket.
+
+        direction: 'left', 'right', 'up', 'down', or 'stop'.
+        Returns True if command was sent successfully.
+        """
+        val = PTZ_VALUES.get(direction)
+        if val is None:
+            log(f"Invalid PTZ direction '{direction}'", "ERROR")
+            return False
+        try:
+            msg = build_clientcmd_ptz(self.camera_id, self.device_uuid, val)
+            self._ctrl_send(msg)
+            log(f"Sent PTZ {direction} (val={val}) to {self.camera_id}", "XMPP")
+            return True
+        except Exception as e:
+            log(f"PTZ {direction} failed for {self.camera_id}: {e}", "ERROR")
+            return False
 
     def refresh(self):
         """Force an immediate relay rediscovery + reconnect.
@@ -1140,6 +1182,19 @@ class StreamHandler(BaseHTTPRequestHandler):
                 self._serve_camera_status(cl)
             else:
                 self._serve_status()
+        elif action == 'ptz':
+            cl = self._get_client(device_id)
+            if not cl:
+                self._send_404("Camera not found")
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            direction = params.get('dir', params.get('action', ['']))[0]
+            ok = cl.send_ptz(direction)
+            self.send_response(200 if ok else 400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"PTZ {direction}: {'ok' if ok else 'error'}".encode())
         elif action == 'trigger':
             cl = self._get_client(device_id)
             if not cl:
@@ -1183,7 +1238,14 @@ class StreamHandler(BaseHTTPRequestHandler):
                 html += f'<a href="/status/{did}">Status</a> | '
                 html += f'<a href="/trigger/{did}">Trigger</a> | '
                 html += f'<a href="/refresh/{did}">Refresh</a></p>\n'
+                html += f'<p><strong>Cloud PTZ:</strong> '
+                html += f'<button onclick="fetch(\'/ptz/{did}?dir=up\')">▲ Up</button> '
+                html += f'<button onclick="fetch(\'/ptz/{did}?dir=down\')">▼ Down</button> '
+                html += f'<button onclick="fetch(\'/ptz/{did}?dir=left\')">◄ Left</button> '
+                html += f'<button onclick="fetch(\'/ptz/{did}?dir=right\')">► Right</button> '
+                html += f'<button onclick="fetch(\'/ptz/{did}?dir=stop\')">█ Stop</button></p>\n'
                 html += f'<img src="/video/{did}" alt="{name}" style="max-width:640px">\n'
+                html += '<hr>\n'
                 html += '<hr>\n'
 
         html += '</body></html>'
